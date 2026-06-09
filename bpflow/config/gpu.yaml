@@ -1,0 +1,29 @@
+# Real-training config (single/multi-GPU). 3-stream joint-attention model.
+# Inherits architecture + normalization from base.yaml.
+# Use:    python -m bpflow.train --config bpflow/config/gpu.yaml
+# DDP:    torchrun --nproc_per_node=N -m bpflow.train --config bpflow/config/gpu.yaml
+
+_base_: base.yaml
+
+experiment_id: bpflow_gpu_p10
+
+model:
+  patch_size: 10
+  hidden_dim: 512
+  num_heads: 8
+  depth: 12
+  joint_depth: 8            # first 8 layers 3-stream joint; last 4 latent-only
+
+training:
+  epochs: 100
+  batch_size: 128            
+  num_workers: 8
+  lr: 1.0e-4
+  warmup_steps: 1000
+  device: cuda
+  amp_dtype: bfloat16
+  use_ema: true
+  max_steps: -1
+  use_swanlab: true
+  swanlab_project: bpflow
+  swanlab_mode: cloud       # cloud | local | offline | disabled

@@ -1,0 +1,75 @@
+# ===== Project-specific (large data & vendored reference, kept out of git) =====
+data/
+paper reference/
+wavflow/
+plan/
+# ===== Training outputs / checkpoints =====
+output/
+outputs/
+runs/
+wandb/
+swanlog/
+lightning_logs/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# ===== Large data / array formats (in case any land outside data/) =====
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.sqlite
+*.db
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# ===== Virtual environments =====
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ===== Tooling caches =====
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.dmypy.json
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ===== Secrets / credentials (never commit) =====
+.env
+.env.*
+settings.json
+.vscode/settings.json
+credentials.json
+*.pem
+*.key
+*_secret*
+*_token*
+
+# ===== Editor / IDE =====
+.vscode/
+.idea/
+*.swp
+*~
+
+# ===== OS =====
+.DS_Store
+**/.DS_Store
+Thumbs.db

@@ -1,0 +1,66 @@
+# BPFlow shared config. train/infer configs reference this via `_base_: base.yaml`.
+# Anything affecting architecture, on-disk shapes, or checkpoint compatibility
+# (patch_size, normalization constants, prediction_type) lives here.
+
+experiment_id: bpflow_base
+
+model:
+  name: bpflow_jointstream  # 3-stream joint attention: ABP latent + ECG + PPG
+  patch_size: 10            # 1250 / 10 = 125 tokens (80 ms each)
+  hidden_dim: 512
+  num_heads: 8              # head_dim 64 (must be even for RoPE)
+  depth: 12
+  mlp_ratio: 4.0
+  joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
+
+data:
+  train_npy: data/pulsedb/Train_Subset.npy
+  test_npy: data/pulsedb/CalFree_Test_Subset.npy
+  seq_len: 1250
+  ecg_channel: 0            # verified: ch0=ECG, ch1=PPG, ch2=ABP
+  ppg_channel: 1
+  abp_channel: 2
+  split_seed: 42
+  val_fraction: 0.2
+  abp_mean: 81.94           # full train split (seed=42, 80%, post-clip)
+  abp_std: 24.43
+  abp_clip_low: 20.0
+  abp_clip_high: 250.0
+  cond_recenter: true
+
+sampling:
+  prediction_type: v        # shared train (loss target) + infer (ODE)
+  method: euler
+  num_steps: 16
+  noise_scale: 1.0
+  noise_shift: 1.0
+  min_sigma: 0.0
+  logit_mean: 0.0
+  logit_scale: 1.0
+
+training:
+  loss_type: v
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 1000
+  clip_grad_norm: 1.0
+  seed: 14159265
+  log_freq: 50
+  ckpt_freq_epoch: 5
+  val_freq_epoch: 5          # in-loop validation every N epochs (0 = off); saves checkpoint_best.pth
+  val_max_batches: 20        # cap val batches (sampling is the cost)
+  ema_decay: 0.9999
+  use_ema: true
+  output_dir: output
+  device: auto
+  amp_dtype: bfloat16
+  max_steps: -1
+  use_swanlab: false        # SwanLab experiment logging (rank-0 only)
+  swanlab_project: bpflow
+  swanlab_mode: cloud       # cloud | local | offline | disabled
+  repeat_factor: 1
+  cfg_strength: 1.0
+  label_drop_prob: 0.0

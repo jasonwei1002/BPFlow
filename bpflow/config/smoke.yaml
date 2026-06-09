@@ -1,0 +1,31 @@
+# Tiny CPU smoke config: overfit a handful of segments to verify the full
+# pipeline (data -> patch -> forward -> flow loss -> backward -> sample) end to
+# end without a GPU. NOT a real model.
+
+_base_: base.yaml
+
+experiment_id: bpflow_smoke
+
+model:
+  patch_size: 50            # 1250 / 50 = 25 tokens
+  hidden_dim: 64
+  num_heads: 2              # head_dim 32 (even)
+  depth: 2
+  joint_depth: 2            # both layers 3-stream joint (0 fused) at this tiny depth
+  mlp_ratio: 2.0
+
+sampling:
+  num_steps: 5
+
+training:
+  batch_size: 8
+  num_workers: 0
+  lr: 5.0e-4
+  warmup_steps: 20
+  log_freq: 50
+  val_freq_epoch: 0          # smoke stops at max_steps mid-epoch; no full-epoch val
+  device: cpu
+  amp_dtype: float32
+  use_ema: false
+  max_steps: 400
+  repeat_factor: 1
