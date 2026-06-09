@@ -168,7 +168,11 @@ class BPFlowModel(nn.Module):
     def forward(
         self, latent_patches: torch.Tensor, cond_patches: torch.Tensor, t: torch.Tensor
     ) -> torch.Tensor:
-        return self.predict_flow(latent_patches, t, self.preprocess_conditions(cond_patches))
+        out = self.predict_flow(latent_patches, t, self.preprocess_conditions(cond_patches))
+        # Keep the CFG null embeddings in the autograd graph (zero contribution)
+        # so DDP sees them as used even when label_drop_prob == 0; otherwise they
+        # receive no grad and DDP raises "parameters not used in producing loss".
+        return out + 0.0 * (self.empty_ecg.sum() + self.empty_ppg.sum())
 
     def get_empty_conditions(self, bs: int) -> BPConditions:
         ecg_p = self.empty_ecg.expand(bs, self.latent_seq_len, -1)
