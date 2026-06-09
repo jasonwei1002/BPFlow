@@ -12,6 +12,7 @@ Run:
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -60,11 +61,37 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
 def run_inference(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     cfg = load_config(args.config)
-    device = pick_device(str(cfg.training.device) if args.device == "auto" else args.device)
+
+    # Distributed (single-node multi-GPU via torchrun). When WORLD_SIZE == 1 this
+    # is identical to the old single-process path.
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    distributed = world_size > 1
+    is_main = rank == 0
+
+    want = str(cfg.training.device) if args.device == "auto" else args.device
+    if distributed:
+        import torch.distributed as dist
+
+        use_cuda = torch.cuda.is_available() and want != "cpu"
+        dist.init_process_group(backend="nccl" if use_cuda else "gloo")
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = pick_device(want)
 
     ds = build_dataset(cfg, args.split)
     if args.num > 0 and args.num < len(ds):
         ds = Subset(ds, list(range(args.num)))
+    total = len(ds)
+    if distributed:
+        # Strided shard: exact coverage, no padding/duplicates. Metrics are
+        # set-level (MAE/RMSE/Pearson/AAMI/BHS) so the gather order is irrelevant.
+        ds = Subset(ds, list(range(rank, total, world_size)))
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = build_model(cfg).to(device).eval()
@@ -77,16 +104,33 @@ def run_inference(args: argparse.Namespace) -> None:
 
     preds, gts = [], []
     for batch in loader:
-        preds.append(sample_abp(
+        out = sample_abp(
             model, fm, batch["cond_patches"], generator=gen, device=device,
             abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std), cfg_strength=cfg_s,
-        ))
-        gts.append(batch["abp_raw"])
-        logger.info("generated %d / %d", sum(p.shape[0] for p in preds), len(ds))
+        )
+        preds.append(out.cpu())
+        gts.append(batch["abp_raw"].cpu())
+        if is_main:
+            logger.info("generated %d (rank0 shard of %d total)",
+                        sum(p.shape[0] for p in preds), total)
 
-    pred = torch.cat(preds, dim=0)
-    gt = torch.cat(gts, dim=0)
+    pred = torch.cat(preds, dim=0) if preds else None
+    gt = torch.cat(gts, dim=0) if gts else None
+
+    if distributed:
+        import torch.distributed as dist
+
+        gathered: list = [None] * world_size
+        dist.all_gather_object(gathered, (pred, gt))
+        dist.barrier()
+        dist.destroy_process_group()
+        if not is_main:
+            return
+        pred = torch.cat([p for p, _ in gathered if p is not None], dim=0)
+        gt = torch.cat([g for _, g in gathered if g is not None], dim=0)
+
     report = evaluate(pred, gt)
+    logger.info("evaluated %d segments across %d process(es)", pred.shape[0], world_size)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
