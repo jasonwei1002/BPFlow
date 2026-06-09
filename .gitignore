@@ -9,6 +9,7 @@ outputs/
 runs/
 wandb/
 swanlog/
+swanlab_log/
 lightning_logs/
 checkpoints/
 *.pth
