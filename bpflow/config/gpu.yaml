@@ -14,9 +14,9 @@ model:
 
 training:
   epochs: 100
-  batch_size: 128            
+  batch_size: 256            # 2x for optimization stability; mem ~32%@128 -> ~60%@256
   num_workers: 8
-  lr: 1.0e-4
+  lr: 1.4e-4               # sqrt-scaled for bs 128->256 (AdamW); linear rule = 2.0e-4
   warmup_steps: 1000
   device: cuda
   amp_dtype: bfloat16
