@@ -14,9 +14,9 @@ model:
 
 training:
   epochs: 100
-  batch_size: 256            # 2x for optimization stability; mem ~32%@128 -> ~60%@256
+  batch_size: 128            # per-GPU (DDP global = 128 x num_gpus)
   num_workers: 8
-  lr: 1.4e-4               # sqrt-scaled for bs 128->256 (AdamW); linear rule = 2.0e-4
+  lr: 3.0e-4               # 8 GPUs x bs128 = global 1024; sqrt-scaled from 1e-4@128 (~2.8e-4)
   warmup_steps: 1000
   device: cuda
   amp_dtype: bfloat16
