@@ -4,8 +4,6 @@
 
 _base_: base.yaml
 
-experiment_id: bpflow_smoke
-
 model:
   patch_size: 50            # 1250 / 50 = 25 tokens
   hidden_dim: 64

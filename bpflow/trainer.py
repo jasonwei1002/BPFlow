@@ -9,6 +9,7 @@ import contextlib
 import logging
 import os
 import time
+from datetime import datetime
 from typing import List, Optional
 
 import torch
@@ -52,7 +53,11 @@ class Trainer:
                 torch.cuda.set_device(self.local_rank)
                 self.device = torch.device(f"cuda:{self.local_rank}")
 
-        self.exp_dir = os.path.join(str(cfg.training.output_dir), str(cfg.experiment_id))
+        # Run is named by a timestamp (rank-0 picks it, broadcast under DDP so all
+        # ranks agree on exp_dir — _maybe_resume reads it on every rank). SwanLab
+        # gets no experiment_name and auto-generates its own run id.
+        self.run_name = self._make_run_name()
+        self.exp_dir = os.path.join(str(cfg.training.output_dir), self.run_name)
         if is_main_process():
             os.makedirs(self.exp_dir, exist_ok=True)
 
@@ -130,6 +135,17 @@ class Trainer:
             groups, lr=float(self.cfg.training.lr), betas=(0.9, 0.95)
         )
 
+    def _make_run_name(self) -> str:
+        """Timestamp run name; rank 0 picks it and broadcasts so DDP ranks agree."""
+        name = datetime.now().strftime("%Y%m%d_%H%M%S") if is_main_process() else ""
+        if self.distributed:
+            import torch.distributed as dist
+
+            obj = [name]
+            dist.broadcast_object_list(obj, src=0)
+            name = obj[0]
+        return name
+
     def _init_swanlab(self) -> None:
         """Start a SwanLab run on rank 0 if enabled (lazy import, never fatal)."""
         if not bool(self.cfg.training.use_swanlab) or not is_main_process():
@@ -139,17 +155,21 @@ class Trainer:
         except ImportError:
             logger.warning("use_swanlab=true but swanlab is not installed; skipping (pip install swanlab).")
             return
+        # No experiment_name -> SwanLab auto-generates its run id. Record run_name
+        # (the checkpoint dir) in config so the run links back to its checkpoints.
+        config = OmegaConf.to_container(self.cfg, resolve=True)
+        assert isinstance(config, dict)
+        config["run_name"] = self.run_name
         swanlab.init(
             project=str(self.cfg.training.swanlab_project),
-            experiment_name=str(self.cfg.experiment_id),
             description="BPFlow ECG+PPG -> ABP flow matching",
-            config=OmegaConf.to_container(self.cfg, resolve=True),
+            config=config,
             mode=str(self.cfg.training.swanlab_mode),
         )
         self.sw = swanlab
         logger.info(
-            "SwanLab enabled (project=%s, run=%s, mode=%s)",
-            self.cfg.training.swanlab_project, self.cfg.experiment_id, self.cfg.training.swanlab_mode,
+            "SwanLab enabled (project=%s, ckpt_dir=%s, mode=%s)",
+            self.cfg.training.swanlab_project, self.exp_dir, self.cfg.training.swanlab_mode,
         )
 
     def _sw_log(self, data: dict, step: int) -> None:

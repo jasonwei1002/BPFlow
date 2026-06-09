@@ -5,8 +5,6 @@
 
 _base_: base.yaml
 
-experiment_id: bpflow_gpu_p10
-
 model:
   patch_size: 10
   hidden_dim: 512

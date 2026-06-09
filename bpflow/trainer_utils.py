@@ -94,7 +94,6 @@ class TrainingConfig:
 
 @dataclass
 class BPFlowConfig:
-    experiment_id: str = "bpflow"
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)

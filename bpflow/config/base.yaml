@@ -2,8 +2,6 @@
 # Anything affecting architecture, on-disk shapes, or checkpoint compatibility
 # (patch_size, normalization constants, prediction_type) lives here.
 
-experiment_id: bpflow_base
-
 model:
   name: bpflow_jointstream  # 3-stream joint attention: ABP latent + ECG + PPG
   patch_size: 10            # 1250 / 10 = 125 tokens (80 ms each)
