@@ -15,6 +15,7 @@ from typing import List, Optional
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .data import build_dataset
 from .eval import evaluate, format_report
@@ -261,14 +262,22 @@ class Trainer:
             if self.sampler is not None:
                 self.sampler.set_epoch(epoch)
             self.model.train()
-            for batch in self.loader:
+            # Per-epoch progress bar (rank 0 only; a no-op on other ranks).
+            pbar = tqdm(
+                self.loader,
+                desc=f"epoch {epoch}/{n_epochs}",
+                disable=not is_main_process(),
+                dynamic_ncols=True,
+                leave=False,
+            )
+            for batch in pbar:
                 metrics = self._train_step(batch)
                 self.global_step += 1
-                if is_main_process() and self.global_step % log_freq == 0:
-                    logger.info(
-                        "step %d epoch %d loss %.4f lr %.2e gnorm %.3f",
-                        self.global_step, epoch, metrics["loss"], metrics["lr"], metrics["grad_norm"],
+                if is_main_process():
+                    pbar.set_postfix_str(
+                        f"loss={metrics['loss']:.4f} lr={metrics['lr']:.2e} gnorm={metrics['grad_norm']:.2f}"
                     )
+                if is_main_process() and self.global_step % log_freq == 0:
                     self._sw_log(
                         {
                             "train/loss": metrics["loss"],
@@ -279,11 +288,13 @@ class Trainer:
                         self.global_step,
                     )
                 if 0 < max_steps <= self.global_step:
+                    pbar.close()
                     if is_main_process():
                         logger.info("Reached max_steps=%d, stopping.", max_steps)
                         self.save_checkpoint(epoch, "checkpoint_latest.pth")
                     self._barrier()
                     return
+            pbar.close()
             done = epoch + 1
             if val_freq > 0 and done % val_freq == 0:
                 self._run_validation(done)
