@@ -49,7 +49,7 @@ training:
   log_freq: 50
   ckpt_freq_epoch: 5
   val_freq_epoch: 5          # in-loop validation every N epochs (0 = off); saves checkpoint_best.pth
-  val_max_batches: 20        # cap val batches (sampling is the cost)
+  val_max_batches: 50        # cap val batches (sampling is the cost)
   ema_decay: 0.9999
   use_ema: true
   output_dir: output
