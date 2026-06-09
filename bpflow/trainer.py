@@ -69,6 +69,9 @@ class Trainer:
         self.global_step = 0
         self.start_epoch = 0
         self.best_val = float("inf")
+        self.epochs_no_improve = 0  # consecutive validations w/o val improvement
+        self.lr_scale = 1.0         # plateau lr multiplier (applied in _train_step)
+        self.should_stop = False    # set by early stopping
         self.gen = torch.Generator(device=self.device)
         self.gen.manual_seed(int(cfg.training.seed) + self.rank)
         self._maybe_resume()
@@ -112,6 +115,11 @@ class Trainer:
             )
 
     def _build_model(self) -> None:
+        if self.is_cuda:
+            # TF32 for fp32 matmul/conv paths (zero-risk alongside bf16 training).
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         model = build_model(self.cfg).to(self.device)
         self.model_raw = model
         if self.distributed and self.is_cuda:
@@ -120,6 +128,13 @@ class Trainer:
             )
         else:
             self.model = model
+        # Compile the training-forward path (CUDA only). Sampling/validation use
+        # the eager model_raw, so variable val batch sizes never trigger a
+        # recompile; the fixed train batch (drop_last) keeps one compiled graph.
+        if self.is_cuda and bool(self.cfg.training.use_compile):
+            self.model = torch.compile(self.model)
+            if is_main_process():
+                logger.info("torch.compile enabled (first step compiles, then speeds up)")
         self.fm = build_flow_matching(self.cfg)
         self.use_ema = bool(self.cfg.training.use_ema)
         self.ema_decay = float(self.cfg.training.ema_decay)
@@ -218,7 +233,7 @@ class Trainer:
         return abp, cond
 
     def _train_step(self, batch) -> dict:
-        lr = adjust_learning_rate(self.optimizer, self.global_step, self.cfg)
+        lr = adjust_learning_rate(self.optimizer, self.global_step, self.cfg, self.lr_scale)
         with self._autocast():
             abp, cond = self._prepare_batch(batch)
             loss = flow_matching_loss(
@@ -298,6 +313,12 @@ class Trainer:
             done = epoch + 1
             if val_freq > 0 and done % val_freq == 0:
                 self._run_validation(done)
+                if self.should_stop:
+                    if is_main_process():
+                        self.save_checkpoint(done, "checkpoint_latest.pth")
+                        logger.info("Early stopped at epoch %d (best val MAE %.4f).", done, self.best_val)
+                    self._barrier()
+                    return
             if is_main_process() and ckpt_freq > 0 and done % ckpt_freq == 0:
                 self.save_checkpoint(done, "checkpoint_latest.pth")
             self._barrier()
@@ -308,12 +329,40 @@ class Trainer:
             self.save_checkpoint(n_epochs, "checkpoint_latest.pth")
 
     def _run_validation(self, done_epochs: int) -> None:
+        # validate() returns the real MAE on rank 0 and inf elsewhere, so all
+        # plateau/early-stop decisions are made on rank 0 then broadcast.
         val_mae = self.validate()
-        if is_main_process() and val_mae < self.best_val:
-            self.best_val = val_mae
-            self.save_checkpoint(done_epochs, "checkpoint_best.pth")
-            logger.info("New best val MAE %.3f mmHg @ epoch %d -> checkpoint_best.pth", val_mae, done_epochs)
+        if is_main_process():
+            if val_mae < self.best_val:
+                self.best_val = val_mae
+                self.epochs_no_improve = 0
+                self.save_checkpoint(done_epochs, "checkpoint_best.pth")
+                logger.info("New best val MAE %.4f mmHg @ epoch %d -> checkpoint_best.pth", val_mae, done_epochs)
+            else:
+                self.epochs_no_improve += 1
+                logger.info("val MAE %.4f: no improvement for %d val round(s) (best %.4f)",
+                            val_mae, self.epochs_no_improve, self.best_val)
+                lr_pat = int(self.cfg.training.lr_patience)
+                if lr_pat > 0 and self.epochs_no_improve % lr_pat == 0:
+                    self.lr_scale *= float(self.cfg.training.lr_decay)
+                    logger.info("LR plateau (%d rounds): lr_scale -> %.4g (base_lr x this)",
+                                self.epochs_no_improve, self.lr_scale)
+                es_pat = int(self.cfg.training.early_stop_patience)
+                if es_pat > 0 and self.epochs_no_improve >= es_pat:
+                    self.should_stop = True
+                    logger.info("Early stop: no val improvement for %d val round(s).", self.epochs_no_improve)
+        self._sync_val_state()
         self._barrier()
+
+    def _sync_val_state(self) -> None:
+        """Broadcast rank-0 plateau/early-stop state to all ranks (DDP)."""
+        if not self.distributed:
+            return
+        import torch.distributed as dist
+
+        obj = [self.best_val, self.epochs_no_improve, self.lr_scale, self.should_stop]
+        dist.broadcast_object_list(obj, src=0)
+        self.best_val, self.epochs_no_improve, self.lr_scale, self.should_stop = obj
 
     # -- sampling ----------------------------------------------------------
     @torch.no_grad()
@@ -387,6 +436,8 @@ class Trainer:
             "epoch": epoch,
             "global_step": self.global_step,
             "best_val": self.best_val,
+            "epochs_no_improve": self.epochs_no_improve,
+            "lr_scale": self.lr_scale,
             "config": OmegaConf.to_container(self.cfg, resolve=True),
             "abp_mean": float(self.cfg.data.abp_mean),
             "abp_std": float(self.cfg.data.abp_std),
@@ -412,8 +463,11 @@ class Trainer:
         self.start_epoch = int(ckpt.get("epoch", 0))
         self.global_step = int(ckpt.get("global_step", 0))
         self.best_val = float(ckpt.get("best_val", float("inf")))
+        self.epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+        self.lr_scale = float(ckpt.get("lr_scale", 1.0))
         if is_main_process():
-            logger.info("Resumed from %s (epoch %d, step %d)", path, self.start_epoch, self.global_step)
+            logger.info("Resumed from %s (epoch %d, step %d, lr_scale %.4g)",
+                        path, self.start_epoch, self.global_step, self.lr_scale)
 
     def _barrier(self) -> None:
         if self.distributed:

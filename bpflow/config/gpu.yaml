@@ -22,6 +22,10 @@ training:
   amp_dtype: bfloat16
   use_ema: true
   max_steps: -1
+  val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
+  lr_patience: 5             # 5 epochs w/o val improvement -> lr x lr_decay
+  lr_decay: 0.1              # "下降10倍"
+  early_stop_patience: 10    # 10 epochs w/o val improvement -> stop
   use_swanlab: true
   swanlab_project: bpflow
   swanlab_mode: cloud       # cloud | local | offline | disabled

@@ -80,12 +80,18 @@ class TrainingConfig:
     val_max_batches: int = 20  # cap val batches for speed
     ema_decay: float = 0.9999
     use_ema: bool = True
+    # ReduceLROnPlateau + early stop, counted in validation rounds w/o improvement
+    # (= epochs when val_freq_epoch == 1). 0 disables that branch.
+    lr_patience: int = 5       # val rounds w/o val improvement before lr *= lr_decay
+    lr_decay: float = 0.1      # lr multiplier applied on each plateau
+    early_stop_patience: int = 10  # val rounds w/o val improvement before stopping
     output_dir: str = "output"
     device: str = "auto"  # 'auto' | 'cpu' | 'cuda'
     use_swanlab: bool = False  # log metrics to SwanLab (rank-0 only)
     swanlab_project: str = "bpflow"
     swanlab_mode: str = "cloud"  # cloud | local | offline | disabled
     amp_dtype: str = "bfloat16"  # 'bfloat16' | 'float16' | 'float32' (cuda only)
+    use_compile: bool = True  # torch.compile the training-forward path (CUDA only)
     max_steps: int = -1  # cap total steps (smoke); -1 = unlimited
     repeat_factor: int = 1  # repeat each batch along B (smoke overfit aid)
     cfg_strength: float = 1.0  # >1 enables classifier-free guidance at sampling
@@ -175,12 +181,13 @@ def add_weight_decay(model: torch.nn.Module, weight_decay: float = 0.0, skip_lis
     ]
 
 
-def adjust_learning_rate(optimizer, global_step: int, cfg) -> float:
-    """Step-based linear warmup, then constant lr."""
+def adjust_learning_rate(optimizer, global_step: int, cfg, lr_scale: float = 1.0) -> float:
+    """Step-based linear warmup, then constant lr, times a plateau ``lr_scale``."""
     lr = float(cfg.training.lr)
     warmup = int(cfg.training.warmup_steps)
     if warmup > 0 and global_step < warmup:
         lr = lr * (global_step + 1) / warmup
+    lr *= lr_scale
     for pg in optimizer.param_groups:
         pg["lr"] = lr
     return lr
