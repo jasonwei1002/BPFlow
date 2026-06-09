@@ -411,8 +411,9 @@ class Trainer:
         self.model_raw.eval()
         preds, gts = [], []
         max_b = int(self.cfg.training.val_max_batches)
+        n_total = min(max_b, len(self.val_loader)) if max_b > 0 else len(self.val_loader)
         with self._ema_swapped(self.use_ema):
-            for bi, batch in enumerate(self.val_loader):
+            for bi, batch in enumerate(tqdm(self.val_loader, total=n_total, desc="val", leave=False)):
                 if 0 < max_b <= bi:
                     break
                 preds.append(self._sample_cond(batch["cond_patches"]))

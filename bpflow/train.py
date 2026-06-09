@@ -8,6 +8,7 @@ Multi-GPU (DDP):
 
 import argparse
 import logging
+import os
 
 from .trainer import Trainer
 from .trainer_utils import load_config
@@ -22,8 +23,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Only rank 0 prints INFO; other DDP ranks stay quiet (WARNING+) so the
+    # terminal isn't multiplied by the number of GPUs.
+    rank = int(os.environ.get("RANK", 0))
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=logging.INFO if rank == 0 else logging.WARNING,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     args = parse_args()
     cfg = load_config(args.config)

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 from .data import build_dataset
 from .eval import evaluate, format_report
@@ -103,16 +104,14 @@ def run_inference(args: argparse.Namespace) -> None:
     cfg_s = float(args.cfg if args.cfg is not None else cfg.training.cfg_strength)
 
     preds, gts = [], []
-    for batch in loader:
+    desc = f"infer (rank0 shard of {total})" if distributed else f"infer ({total})"
+    for batch in tqdm(loader, desc=desc, disable=not is_main):
         out = sample_abp(
             model, fm, batch["cond_patches"], generator=gen, device=device,
             abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std), cfg_strength=cfg_s,
         )
         preds.append(out.cpu())
         gts.append(batch["abp_raw"].cpu())
-        if is_main:
-            logger.info("generated %d (rank0 shard of %d total)",
-                        sum(p.shape[0] for p in preds), total)
 
     pred = torch.cat(preds, dim=0) if preds else None
     gt = torch.cat(gts, dim=0) if gts else None
@@ -173,7 +172,11 @@ def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    rank = int(os.environ.get("RANK", 0))  # only rank 0 prints INFO under torchrun
+    logging.basicConfig(
+        level=logging.INFO if rank == 0 else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     ap = argparse.ArgumentParser(description="BPFlow inference + evaluation")
     ap.add_argument("--config", required=True)
     ap.add_argument("--ckpt", required=True)
