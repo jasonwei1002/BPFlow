@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Force-sync local repo to remote (discards local commits & changes to TRACKED files).
-# Untracked / gitignored files (data/, wavflow/, plan/, CLAUDE.md ...) are kept.
+# Untracked / gitignored files (rawdata/, wavflow/, plan/, CLAUDE.md ...) are kept.
 # Usage: bash gitpull.sh          (sync current branch to remote main)
 #        bash gitpull.sh <branch> (sync to a specific remote branch)
 set -euo pipefail

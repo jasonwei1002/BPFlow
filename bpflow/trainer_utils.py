@@ -34,8 +34,8 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    train_npy: str = "data/pulsedb/Train_Subset.npy"
-    test_npy: str = "data/pulsedb/CalFree_Test_Subset.npy"
+    train_npy: str = "rawdata/pulsedb/Train_Subset.npy"
+    test_npy: str = "rawdata/pulsedb/CalFree_Test_Subset.npy"
     seq_len: int = 1250
     ecg_channel: int = 0
     ppg_channel: int = 1

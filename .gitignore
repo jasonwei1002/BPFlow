@@ -1,5 +1,5 @@
 # ===== Project-specific (large data & vendored reference, kept out of git) =====
-data/
+/rawdata/
 paper reference/
 wavflow/
 plan/

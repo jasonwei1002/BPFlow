@@ -12,8 +12,8 @@ model:
   joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
 
 data:
-  train_npy: data/pulsedb/Train_Subset.npy
-  test_npy: data/pulsedb/CalFree_Test_Subset.npy
+  train_npy: rawdata/pulsedb/Train_Subset.npy
+  test_npy: rawdata/pulsedb/CalFree_Test_Subset.npy
   seq_len: 1250
   ecg_channel: 0            # verified: ch0=ECG, ch1=PPG, ch2=ABP
   ppg_channel: 1
