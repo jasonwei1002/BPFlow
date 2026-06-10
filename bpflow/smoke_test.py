@@ -25,12 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
-def _sample_mmhg(model, fm, cond, gen, device, cfg) -> torch.Tensor:
+def _sample_mmhg(model, fm, cond, gen, device, cfg, calib=None) -> torch.Tensor:
     """Eval-mode ABP sample in mmHg for the overfit set."""
     model.eval()
     out = sample_abp(
         model, fm, cond, generator=gen, device=device,
         abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std),
+        calib=calib,
     )
     model.train()
     return out
@@ -48,6 +49,14 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
     abp = torch.stack([it["abp_patches"] for it in items]).to(device)
     cond = torch.stack([it["cond_patches"] for it in items]).to(device)
     abp_gt = torch.stack([it["abp_raw"] for it in items])  # (B,L) mmHg
+    # K-shot calibration support, when enabled (fixed for the overfit set).
+    calib = None
+    if bool(cfg.model.use_calib):
+        cc = torch.stack([it["calib_cond"] for it in items]).to(device)
+        cbp = torch.stack([it["calib_bp"] for it in items]).to(device)
+        cm = torch.stack([it["calib_mask"] for it in items]).to(device)
+        calib = (cc, cbp, cm)
+        logger.info("calibration ON: K_max=%d, valid/sample=%s", cc.shape[1], cm.sum(dim=1).tolist())
 
     model = build_model(cfg).to(device)
     fm = build_flow_matching(cfg)
@@ -57,7 +66,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
 
     # baseline (untrained) reconstruction
     gen.manual_seed(123)
-    pred0 = _sample_mmhg(model, fm, cond, gen, device, cfg)
+    pred0 = _sample_mmhg(model, fm, cond, gen, device, cfg, calib)
     mae0 = (pred0 - abp_gt).abs().mean().item()
 
     losses = []
@@ -67,6 +76,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
             model, fm, abp, cond, generator=gen,
             logit_mean=float(cfg.sampling.logit_mean), logit_scale=float(cfg.sampling.logit_scale),
             prediction_type=str(cfg.sampling.prediction_type), loss_type=str(cfg.training.loss_type),
+            calib=calib,
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -80,7 +90,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
     final_loss = sum(losses[-10:]) / 10
 
     gen.manual_seed(123)
-    pred1 = _sample_mmhg(model, fm, cond, gen, device, cfg)
+    pred1 = _sample_mmhg(model, fm, cond, gen, device, cfg, calib)
     mae1 = (pred1 - abp_gt).abs().mean().item()
     report = evaluate(pred1, abp_gt)
 

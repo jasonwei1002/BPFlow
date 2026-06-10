@@ -6,10 +6,13 @@ from torch.utils.data import Dataset
 
 from .pulsedb_dataset import PulseDBDataset, build_dataset
 from .transforms import (
+    DEMO_CONT_DIM,
     build_cond_patches,
     destandardize_abp,
     patchify,
     standardize_abp,
+    standardize_bp,
+    standardize_demo,
     unpatchify,
 )
 
@@ -36,4 +39,7 @@ __all__ = [
     "patchify",
     "unpatchify",
     "build_cond_patches",
+    "standardize_demo",
+    "standardize_bp",
+    "DEMO_CONT_DIM",
 ]

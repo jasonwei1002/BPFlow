@@ -11,6 +11,13 @@ model:
   num_heads: 8
   depth: 12
   joint_depth: 8            # first 8 layers 3-stream joint; last 4 latent-only
+  use_demo: true            # P1: condition on age/gender/height/weight/bmi (zero-init prior)
+  use_calib: true           # K-shot cuff-calibration personalization (zero-init prior)
+
+data:
+  split_mode: subject       # P0: subject-disjoint train/val (honest, matches CalFree test)
+  calib_k_max: 10           # train randomizes K in [0,10] per sample (K=0 == calibration-free)
+  calib_eval_k: 10          # val/test use a fixed 10-shot calibration
 
 training:
   epochs: 200
@@ -23,9 +30,12 @@ training:
   use_ema: true
   max_steps: -1
   val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
+  val_max_batches: -1        # full val split (DDP-sharded across GPUs; -1 = all)
   lr_patience: 5             # 5 epochs w/o val improvement -> lr x lr_decay
   lr_decay: 0.1              # "下降10倍"
   early_stop_patience: 10    # 10 epochs w/o val improvement -> stop
   use_swanlab: true
   swanlab_project: bpflow
   swanlab_mode: cloud       # cloud | local | offline | disabled
+  run_test_after_train: true # after training, eval CalFree test (best EMA) + log test/* to SwanLab
+  test_max_segments: -1      # all CalFree segments (DDP-sharded across GPUs)

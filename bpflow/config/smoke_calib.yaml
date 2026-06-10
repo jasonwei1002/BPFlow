@@ -1,0 +1,15 @@
+# Tiny CPU smoke config WITH K-shot cuff-calibration enabled. Verifies the
+# calibration path (dataset same-subject support sampling -> CalibrationEncoder
+# -> global_c) overfits end to end on CPU. Needs the sibling Train_Subset.csv
+# (subject_id + sbp/dbp). NOT a real model.
+#
+# Run:  python -m bpflow.smoke_test --config bpflow/config/smoke_calib.yaml
+
+_base_: smoke.yaml
+
+model:
+  use_calib: true           # turn on the K-shot calibration encoder (zero-init)
+
+data:
+  calib_k_max: 4            # small support for the tiny smoke run
+  calib_eval_k: 4

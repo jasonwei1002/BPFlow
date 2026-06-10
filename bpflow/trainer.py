@@ -6,6 +6,7 @@ on availability so a tiny CPU smoke test never hits a hard cuda call.
 """
 
 import contextlib
+import json
 import logging
 import os
 import time
@@ -14,11 +15,12 @@ from typing import List, Optional
 
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from .data import build_dataset
-from .eval import evaluate, format_report
+from .eval import aami, bhs, format_report, segment_bp
+from .eval.metrics import _pearson
 from .model import build_model
 from .sampling import build_flow_matching, flow_matching_loss, sample_abp
 from .trainer_utils import (
@@ -100,11 +102,14 @@ class Trainer:
             pin_memory=self.is_cuda,
             persistent_workers=int(self.cfg.training.num_workers) > 0,
         )
-        # Validation loader (built only on the main process; in-loop val runs
-        # there). val split is a held-out 20% of Train_Subset (same seed).
+        # Validation loader (built on EVERY rank; validation is DDP-sharded and
+        # gathered). val split is a held-out 20% of Train_Subset (same seed).
         self.val_loader = None
-        if int(self.cfg.training.val_freq_epoch) > 0 and is_main_process():
+        if int(self.cfg.training.val_freq_epoch) > 0:
             val_ds = build_dataset(self.cfg, "val")
+            if self.distributed:
+                # strided shard: exact coverage, no padding/duplicates
+                val_ds = Subset(val_ds, list(range(self.rank, len(val_ds), self.world_size)))
             self.val_loader = DataLoader(
                 val_ds,
                 batch_size=int(self.cfg.training.batch_size),
@@ -193,15 +198,15 @@ class Trainer:
             self.sw.log(data, step=step)
 
     @staticmethod
-    def _flat_val(report: dict) -> dict:
-        """Flatten the eval report into scalar metrics for logging."""
-        out = {f"val/{k}": float(v) for k, v in report["waveform"].items()}
+    def _flat_report(report: dict, prefix: str = "val") -> dict:
+        """Flatten the eval report into scalar metrics for logging (val/ or test/)."""
+        out = {f"{prefix}/{k}": float(v) for k, v in report["waveform"].items()}
         for key in ("SBP", "DBP", "MAP"):
             a, b = report[key]["AAMI"], report[key]["BHS"]
-            out[f"val/{key}_ME"] = float(a["ME"])
-            out[f"val/{key}_SDE"] = float(a["SDE"])
-            out[f"val/{key}_AAMI_pass"] = float(a["pass"])
-            out[f"val/{key}_within5mmHg"] = float(b["<=5mmHg"])
+            out[f"{prefix}/{key}_ME"] = float(a["ME"])
+            out[f"{prefix}/{key}_SDE"] = float(a["SDE"])
+            out[f"{prefix}/{key}_AAMI_pass"] = float(a["pass"])
+            out[f"{prefix}/{key}_within5mmHg"] = float(b["<=5mmHg"])
         return out
 
     def _autocast(self):
@@ -218,7 +223,28 @@ class Trainer:
         if rf > 1:
             abp = abp.repeat(rf, 1, 1)
             cond = cond.repeat(rf, 1, 1)
-        # optional classifier-free training: drop condition to learned null
+        # Demographics ride along as a global prior (not a CFG-dropped condition).
+        demo = None
+        if bool(self.cfg.model.use_demo) and "demo_cont" in batch:
+            cont = batch["demo_cont"].to(self.device, non_blocking=True)
+            gender = batch["demo_gender"].to(self.device, non_blocking=True)
+            if rf > 1:
+                cont = cont.repeat(rf, 1)
+                gender = gender.repeat(rf)
+            demo = (cont, gender)
+        # K-shot calibration support: a real global prior, never CFG-dropped.
+        calib = None
+        if bool(self.cfg.model.use_calib) and "calib_cond" in batch:
+            cc = batch["calib_cond"].to(self.device, non_blocking=True)   # (B,K,N,2P)
+            cbp = batch["calib_bp"].to(self.device, non_blocking=True)    # (B,K,2)
+            cm = batch["calib_mask"].to(self.device, non_blocking=True)   # (B,K)
+            if rf > 1:
+                cc = cc.repeat(rf, 1, 1, 1)
+                cbp = cbp.repeat(rf, 1, 1)
+                cm = cm.repeat(rf, 1)
+            calib = (cc, cbp, cm)
+        # optional classifier-free training: drop the ECG/PPG condition to learned
+        # null (demo/calib priors are intentionally left untouched).
         p = float(self.cfg.training.label_drop_prob)
         if p > 0.0:
             mask = (torch.rand(cond.shape[0], device=self.device, generator=self.gen) < p)
@@ -230,12 +256,12 @@ class Trainer:
                 dim=-1,
             )
             cond = torch.where(mask[:, None, None], null, cond)
-        return abp, cond
+        return abp, cond, demo, calib
 
     def _train_step(self, batch) -> dict:
         lr = adjust_learning_rate(self.optimizer, self.global_step, self.cfg, self.lr_scale)
         with self._autocast():
-            abp, cond = self._prepare_batch(batch)
+            abp, cond, demo, calib = self._prepare_batch(batch)
             loss = flow_matching_loss(
                 self.model, self.fm, abp, cond,
                 generator=self.gen,
@@ -243,6 +269,8 @@ class Trainer:
                 logit_scale=float(self.cfg.sampling.logit_scale),
                 prediction_type=str(self.cfg.sampling.prediction_type),
                 loss_type=str(self.cfg.training.loss_type),
+                demo=demo,
+                calib=calib,
             )
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -318,6 +346,7 @@ class Trainer:
                         self.save_checkpoint(done, "checkpoint_latest.pth")
                         logger.info("Early stopped at epoch %d (best val MAE %.4f).", done, self.best_val)
                     self._barrier()
+                    self._maybe_run_test()
                     return
             if is_main_process() and ckpt_freq > 0 and done % ckpt_freq == 0:
                 self.save_checkpoint(done, "checkpoint_latest.pth")
@@ -327,6 +356,7 @@ class Trainer:
         if is_main_process():
             logger.info("Training done in %.1fs", time.time() - start)
             self.save_checkpoint(n_epochs, "checkpoint_latest.pth")
+        self._maybe_run_test()
 
     def _run_validation(self, done_epochs: int) -> None:
         # validate() returns the real MAE on rank 0 and inf elsewhere, so all
@@ -365,8 +395,28 @@ class Trainer:
         self.best_val, self.epochs_no_improve, self.lr_scale, self.should_stop = obj
 
     # -- sampling ----------------------------------------------------------
+    def _batch_demo(self, batch):
+        """Pull a (cont, gender) demographics sample from a batch, or None.
+
+        Left on CPU; ``sample_abp`` moves it to device. No repeat/drop here —
+        sampling uses the natural batch.
+        """
+        if not bool(self.cfg.model.use_demo) or "demo_cont" not in batch:
+            return None
+        return batch["demo_cont"], batch["demo_gender"]
+
+    def _batch_calib(self, batch):
+        """Pull a (cond, bp, mask) calibration sample from a batch, or None.
+
+        Left on CPU; ``sample_abp`` moves it to device. No repeat/drop here —
+        sampling uses the natural batch.
+        """
+        if not bool(self.cfg.model.use_calib) or "calib_cond" not in batch:
+            return None
+        return batch["calib_cond"], batch["calib_bp"], batch["calib_mask"]
+
     @torch.no_grad()
-    def _sample_cond(self, cond_patches: torch.Tensor) -> torch.Tensor:
+    def _sample_cond(self, cond_patches: torch.Tensor, demo=None, calib=None) -> torch.Tensor:
         """Core sampler; assumes model is already in the desired eval/param state."""
         return sample_abp(
             self.model_raw, self.fm, cond_patches,
@@ -374,6 +424,8 @@ class Trainer:
             abp_mean=float(self.cfg.data.abp_mean), abp_std=float(self.cfg.data.abp_std),
             cfg_strength=float(self.cfg.training.cfg_strength),
             autocast_ctx=self._autocast(),
+            demo=demo,
+            calib=calib,
         )
 
     @contextlib.contextmanager
@@ -403,29 +455,159 @@ class Trainer:
         return out
 
     @torch.no_grad()
-    def validate(self) -> float:
-        """Generate on the held-out val split; return mean waveform MAE (mmHg)."""
-        if self.val_loader is None or not is_main_process():
-            return float("inf")
+    def _distributed_eval(self, loader, desc: str, max_batches: int = -1):
+        """Sample this rank's loader shard, gather PER-SEGMENT quantities to rank 0,
+        and assemble a full report there (None on other ranks).
+
+        Memory-light: gathers each segment's BP values + waveform error summaries
+        (a handful of scalars), never the waveforms, so full-set validation scales
+        to many GPUs. ``max_batches>0`` caps batches PER RANK (<=0 = full set).
+        Assumes model_raw is already in the desired param state (the caller does
+        the EMA swap / best-weights load). ALL ranks must call this together — the
+        all_gather is a collective; an early per-rank return would deadlock.
+        """
         was_training = self.model_raw.training
         self.model_raw.eval()
-        preds, gts = [], []
-        max_b = int(self.cfg.training.val_max_batches)
-        n_total = min(max_b, len(self.val_loader)) if max_b > 0 else len(self.val_loader)
-        with self._ema_swapped(self.use_ema):
-            for bi, batch in enumerate(tqdm(self.val_loader, total=n_total, desc="val", leave=False)):
-                if 0 < max_b <= bi:
-                    break
-                preds.append(self._sample_cond(batch["cond_patches"]))
-                gts.append(batch["abp_raw"])
+        keys = ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t", "ae", "se", "r")
+        cols: dict = {k: [] for k in keys}
+        for bi, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=not is_main_process())):
+            if 0 < max_batches <= bi:
+                break
+            pred = self._sample_cond(
+                batch["cond_patches"], self._batch_demo(batch), self._batch_calib(batch)
+            )  # (b, L) mmHg on CPU
+            gt = batch["abp_raw"]
+            pbp, tbp = segment_bp(pred), segment_bp(gt)
+            err = pred - gt
+            cols["sbp_p"].append(pbp["SBP"]); cols["dbp_p"].append(pbp["DBP"]); cols["map_p"].append(pbp["MAP"])
+            cols["sbp_t"].append(tbp["SBP"]); cols["dbp_t"].append(tbp["DBP"]); cols["map_t"].append(tbp["MAP"])
+            cols["ae"].append(err.abs().mean(dim=1))   # (b,) per-segment MAE
+            cols["se"].append((err ** 2).mean(dim=1))  # (b,) per-segment MSE
+            cols["r"].append(_pearson(pred, gt))        # (b,) per-segment Pearson
         if was_training:
             self.model_raw.train()
-        if not preds:
+        local = {k: torch.cat(v) for k, v in cols.items()} if cols["ae"] else None
+
+        if self.distributed:
+            import torch.distributed as dist
+
+            gathered: list = [None] * self.world_size
+            dist.all_gather_object(gathered, local)
+            self._barrier()
+            if not is_main_process():
+                return None
+            parts = [g for g in gathered if g is not None]
+            if not parts:
+                return None
+            merged = {k: torch.cat([p[k] for p in parts]) for k in parts[0]}
+        else:
+            if local is None:
+                return None
+            merged = local
+        return self._assemble_report(merged)
+
+    @staticmethod
+    def _assemble_report(m: dict) -> dict:
+        """Standard eval report from gathered per-segment quantities.
+
+        MAE/RMSE aggregate exactly because every segment has equal length L (so a
+        mean-of-per-segment-means equals the global mean; same for MSE). Pearson is
+        the per-segment-r mean, matching ``waveform_metrics``.
+        """
+        report = {"waveform": {
+            "MAE": m["ae"].mean().item(),
+            "RMSE": m["se"].mean().sqrt().item(),
+            "Pearson": m["r"].mean().item(),
+        }}
+        pred_bp = {"SBP": m["sbp_p"], "DBP": m["dbp_p"], "MAP": m["map_p"]}
+        true_bp = {"SBP": m["sbp_t"], "DBP": m["dbp_t"], "MAP": m["map_t"]}
+        for key in ("SBP", "DBP", "MAP"):
+            report[key] = {"AAMI": aami(pred_bp[key], true_bp[key]), "BHS": bhs(pred_bp[key], true_bp[key])}
+        return report
+
+    @torch.no_grad()
+    def validate(self) -> float:
+        """Full-set, DDP-sharded validation; mean waveform MAE (mmHg) on rank 0
+        (inf elsewhere). Uses the current in-memory EMA weights. ``val_max_batches``
+        (if > 0) caps batches per rank; <= 0 means the full val split."""
+        if self.val_loader is None:
             return float("inf")
-        report = evaluate(torch.cat(preds), torch.cat(gts))
+        with self._ema_swapped(self.use_ema):
+            report = self._distributed_eval(
+                self.val_loader, "val", int(self.cfg.training.val_max_batches)
+            )
+        if report is None or not is_main_process():
+            return float("inf")
         logger.info("[val] %s", format_report(report).replace("\n", " | "))
-        self._sw_log(self._flat_val(report), self.global_step)
+        self._sw_log(self._flat_report(report, "val"), self.global_step)
         return float(report["waveform"]["MAE"])
+
+    # -- final test --------------------------------------------------------
+    def _maybe_run_test(self) -> None:
+        """After training, optionally evaluate on the CalFree test set.
+
+        Gated by ``training.run_test_after_train``. Runs on ALL ranks (DDP-sharded
+        + gathered), logs ``test/*`` to SwanLab and writes ``test_metrics.json``.
+        Wrapped so a post-train eval failure never crashes an otherwise-finished run.
+        """
+        if not bool(self.cfg.training.run_test_after_train):
+            return
+        self._barrier()  # ensure rank 0 has flushed checkpoint_best.pth to disk
+        try:
+            self.run_test()
+        except Exception as e:
+            if is_main_process():
+                logger.error("Post-train test evaluation failed: %s", e)
+
+    @torch.no_grad()
+    def run_test(self) -> None:
+        """Evaluate the best-by-val (EMA) model on CalFree test; log + save metrics."""
+        test_ds = build_dataset(self.cfg, "test")
+        total = len(test_ds)
+        max_seg = int(self.cfg.training.test_max_segments)
+        if 0 < max_seg < total:
+            test_ds = Subset(test_ds, list(range(max_seg)))
+            total = max_seg
+        shard = test_ds
+        if self.distributed:
+            # Strided shard: exact coverage, no padding. Metrics are set-level.
+            shard = Subset(test_ds, list(range(self.rank, total, self.world_size)))
+        loader = DataLoader(
+            shard, batch_size=int(self.cfg.training.batch_size), shuffle=False,
+            num_workers=int(self.cfg.training.num_workers), pin_memory=self.is_cuda,
+        )
+        src = self._load_eval_weights(os.path.join(self.exp_dir, "checkpoint_best.pth"))
+        report = self._distributed_eval(loader, f"test ({total})", -1)
+        if report is None or not is_main_process():
+            return
+        logger.info("[test] %d segments (weights=%s)\n%s", total, src, format_report(report))
+        self._sw_log(self._flat_report(report, "test"), self.global_step)
+        path = os.path.join(self.exp_dir, "test_metrics.json")
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+        logger.info("test metrics -> %s", path)
+
+    def _load_eval_weights(self, best_path: str) -> str:
+        """Load best-checkpoint EMA (or model) weights into model_raw for testing.
+
+        Returns a short tag of what was loaded. Falls back to the in-memory EMA /
+        last weights when no best checkpoint exists (e.g. validation disabled).
+        Mutates model_raw in place — fine, since training is already over.
+        """
+        if os.path.exists(best_path):
+            ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+            if self.use_ema and "model_ema" in ckpt:
+                names = [n for n, _ in self.model_raw.named_parameters()]
+                for p, n in zip(self.model_raw.parameters(), names):
+                    p.data.copy_(ckpt["model_ema"][n].to(self.device))
+                return "best/ema"
+            self.model_raw.load_state_dict(ckpt["model"])
+            return "best/model"
+        if self.use_ema and self.ema_params is not None:
+            for p, e in zip(self.model_raw.parameters(), self.ema_params):
+                p.data.copy_(e)
+            return "current/ema"
+        return "current/last"
 
     # -- checkpoint --------------------------------------------------------
     def save_checkpoint(self, epoch: int, filename: str) -> None:

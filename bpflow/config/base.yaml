@@ -10,6 +10,8 @@ model:
   depth: 12
   mlp_ratio: 4.0
   joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
+  use_demo: false           # condition on demographics (age/gender/height/weight/bmi)
+  use_calib: false          # K-shot cuff-calibration personalization (zero-init prior)
 
 data:
   train_npy: rawdata/pulsedb/Train_Subset.npy
@@ -20,11 +22,31 @@ data:
   abp_channel: 2
   split_seed: 42
   val_fraction: 0.2
+  split_mode: segment       # segment (subject leaks across train/val) | subject (honest)
   abp_mean: 81.94           # full train split (seed=42, 80%, post-clip)
   abp_std: 24.43
   abp_clip_low: 20.0
   abp_clip_high: 250.0
   cond_recenter: true
+  # demographic z-score constants (full train split, non-NaN); used when model.use_demo
+  demo_age_mean: 61.11
+  demo_age_std: 15.10
+  demo_height_mean: 162.50
+  demo_height_std: 9.64
+  demo_weight_mean: 60.82
+  demo_weight_std: 11.66
+  demo_bmi_mean: 22.92
+  demo_bmi_std: 3.44
+  # K-shot cuff-calibration (model.use_calib). Support = K same-subject segments
+  # carrying ECG/PPG + cuff [SBP,DBP]; needs subject_id CSV for every split.
+  # Train randomizes K in [0,calib_k_max] (K=0 == calibration-free); val/test fix
+  # calib_eval_k. BP z-score constants from the full train split.
+  calib_k_max: 10
+  calib_eval_k: 10
+  bp_sbp_mean: 118.60
+  bp_sbp_std: 21.03
+  bp_dbp_mean: 61.86
+  bp_dbp_std: 12.65
 
 sampling:
   prediction_type: v        # shared train (loss target) + infer (ODE)
@@ -62,3 +84,5 @@ training:
   repeat_factor: 1
   cfg_strength: 1.0
   label_drop_prob: 0.0
+  run_test_after_train: false  # eval CalFree test after training (best EMA) + log test/*
+  test_max_segments: -1        # cap test segments (-1 = all)

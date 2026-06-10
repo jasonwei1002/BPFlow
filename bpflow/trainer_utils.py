@@ -30,6 +30,11 @@ class ModelConfig:
     depth: int = 12
     mlp_ratio: float = 4.0
     joint_depth: int = 8  # number of 3-stream (ABP+ECG+PPG) joint-attention layers
+    use_demo: bool = False  # condition on demographics (age/gender/height/weight/bmi)
+    # K-shot cuff-calibration personalization: encode a same-subject support set
+    # (ECG/PPG + cuff [SBP, DBP] scalars) into a global prior. Zero-init -> no-op
+    # start. Needs data.split providing subject_id (any split) + data.calib_* .
+    use_calib: bool = False
 
 
 @dataclass
@@ -49,6 +54,32 @@ class DataConfig:
     abp_clip_low: float = 20.0
     abp_clip_high: float = 250.0
     cond_recenter: bool = True
+    # Train/val split. "segment" = random per-segment (leaks subjects across
+    # train/val → optimistic val); "subject" = subject-disjoint via CSV
+    # subject_id (honest val, matches the CalFree test setting).
+    split_mode: str = "segment"
+    # Demographic z-score constants from the full train split (non-NaN); used
+    # only when model.use_demo is true. height/weight/bmi are ~48% missing →
+    # carried with a missing flag, NaN→0 (see standardize_demo).
+    demo_age_mean: float = 61.11
+    demo_age_std: float = 15.10
+    demo_height_mean: float = 162.50
+    demo_height_std: float = 9.64
+    demo_weight_mean: float = 60.82
+    demo_weight_std: float = 11.66
+    demo_bmi_mean: float = 22.92
+    demo_bmi_std: float = 3.44
+    # K-shot cuff-calibration (model.use_calib). The support set is K same-subject
+    # segments, each carrying ECG/PPG + cuff [SBP, DBP]. Needs subject_id from the
+    # sibling CSV for EVERY split (test included). Train randomizes K in [0,
+    # calib_k_max] per sample (K=0 == calibration-free); val/test use a fixed
+    # calib_eval_k. BP z-score constants are from the full train split.
+    calib_k_max: int = 10
+    calib_eval_k: int = 10
+    bp_sbp_mean: float = 118.60
+    bp_sbp_std: float = 21.03
+    bp_dbp_mean: float = 61.86
+    bp_dbp_std: float = 12.65
 
 
 @dataclass
@@ -96,6 +127,10 @@ class TrainingConfig:
     repeat_factor: int = 1  # repeat each batch along B (smoke overfit aid)
     cfg_strength: float = 1.0  # >1 enables classifier-free guidance at sampling
     label_drop_prob: float = 0.0  # prob of dropping the condition to null (CFG train)
+    # After training finishes, evaluate on the CalFree test set (best-by-val EMA
+    # weights), log test/* to SwanLab, and write test_metrics.json. DDP-sharded.
+    run_test_after_train: bool = False
+    test_max_segments: int = -1  # cap test segments (-1 = all)
 
 
 @dataclass
