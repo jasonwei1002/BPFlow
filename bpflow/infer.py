@@ -23,7 +23,7 @@ from .data import build_dataset
 from .eval import evaluate, format_report
 from .model import build_model
 from .sampling import build_flow_matching, sample_abp
-from .trainer_utils import load_config, pick_device, set_seed
+from .trainer_utils import drop_legacy_keys, load_config, pick_device, set_seed
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,9 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
     else:
         state = ckpt  # flat state_dict
         logger.info("Loading flat state_dict from %s", ckpt_path)
+    # Drop removed-feature keys (old CFG null conditions) so pre-removal
+    # checkpoints still load; any OTHER missing/unexpected key is still flagged.
+    state = drop_legacy_keys(state)
     # strict=False only to tolerate non-persistent buffers (none are saved);
     # any real missing/unexpected key means a wrong/incompatible checkpoint.
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -101,7 +104,6 @@ def run_inference(args: argparse.Namespace) -> None:
     fm = build_flow_matching(cfg)
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed)
-    cfg_s = float(args.cfg if args.cfg is not None else cfg.training.cfg_strength)
 
     preds, gts = [], []
     use_demo = bool(cfg.model.use_demo)
@@ -110,7 +112,7 @@ def run_inference(args: argparse.Namespace) -> None:
         demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
         out = sample_abp(
             model, fm, batch["cond_patches"], generator=gen, device=device,
-            abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std), cfg_strength=cfg_s,
+            abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std),
             demo=demo,
         )
         preds.append(out.cpu())
@@ -188,7 +190,6 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--use-ema", action="store_true")
-    ap.add_argument("--cfg", type=float, default=None, help="override CFG strength")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=14159265)
     ap.add_argument("--out", default="output/infer")

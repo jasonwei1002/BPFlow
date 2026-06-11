@@ -23,7 +23,7 @@ from .meta_data import load_bp_z, subject_groups
 from .meta_train import _jsonable, _parse_ks
 from .model import build_model
 from .sampling import build_flow_matching
-from .trainer_utils import load_config, pick_device
+from .trainer_utils import drop_legacy_keys, load_config, pick_device
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ def main() -> None:
         model.load_state_dict(sd)
         logger.info("loaded EMA weights")
     else:
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(drop_legacy_keys(ckpt["model"]))
         logger.info("loaded model weights")
     model.eval()
     fm = build_flow_matching(cfg)

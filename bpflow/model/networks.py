@@ -180,9 +180,6 @@ class BPFlowModel(nn.Module):
             ]
         )
         self.final_layer = FinalBlock(hidden_dim, self.latent_dim)
-        # learned null conditions for optional classifier-free guidance
-        self.empty_ecg = nn.Parameter(torch.zeros(1, 1, patch_size))
-        self.empty_ppg = nn.Parameter(torch.zeros(1, 1, patch_size))
         # optional demographic global-condition encoder (zero-init -> no-op start)
         self.use_demo = use_demo
         if use_demo:
@@ -224,8 +221,6 @@ class BPFlowModel(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.conv.weight, 0)
         nn.init.constant_(self.final_layer.conv.bias, 0)
-        nn.init.constant_(self.empty_ecg, 0)
-        nn.init.constant_(self.empty_ppg, 0)
         if self.use_demo:
             # zero-init the encoder output so demographics start as a no-op
             nn.init.constant_(self.demo_encoder.mlp[-1].weight, 0)
@@ -300,27 +295,9 @@ class BPFlowModel(nn.Module):
         demo: Optional[DemoInput] = None,
         context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        out = self.predict_flow(
+        return self.predict_flow(
             latent_patches, t, self.preprocess_conditions(cond_patches, demo, context)
         )
-        # Keep the CFG null embeddings in the autograd graph (zero contribution)
-        # so DDP sees them as used even when label_drop_prob == 0; otherwise they
-        # receive no grad and DDP raises "parameters not used in producing loss".
-        return out + 0.0 * (self.empty_ecg.sum() + self.empty_ppg.sum())
-
-    def get_empty_conditions(
-        self,
-        bs: int,
-        demo: Optional[DemoInput] = None,
-        context: Optional[torch.Tensor] = None,
-    ) -> BPConditions:
-        ecg_p = self.empty_ecg.expand(bs, self.latent_seq_len, -1)
-        ppg_p = self.empty_ppg.expand(bs, self.latent_seq_len, -1)
-        conds = self._embed_cond(ecg_p, ppg_p)
-        # Demographics and the per-subject context are real priors, not CFG-dropped: keep them.
-        conds.demo_emb = self._demo_emb(demo)
-        conds.context_emb = self._context_emb(context, bs)
-        return conds
 
     def predict_bp(self, cond_patches: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
         """Predict (B,2)=[SBP_z, DBP_z] from ECG/PPG + the context phi.
@@ -340,14 +317,8 @@ class BPFlowModel(nn.Module):
         t: torch.Tensor,
         latent: torch.Tensor,
         conditions: BPConditions,
-        empty_conditions: BPConditions,
-        cfg_strength: float,
     ) -> torch.Tensor:
         t = t * torch.ones(len(latent), device=latent.device, dtype=latent.dtype)
-        if cfg_strength > 1.0:
-            return cfg_strength * self.predict_flow(latent, t, conditions) + (
-                1 - cfg_strength
-            ) * self.predict_flow(latent, t, empty_conditions)
         return self.predict_flow(latent, t, conditions)
 
     @property

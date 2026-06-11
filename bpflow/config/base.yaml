@@ -71,7 +71,5 @@ training:
   swanlab_project: bpflow
   swanlab_mode: cloud       # cloud | local | offline | disabled
   repeat_factor: 1
-  cfg_strength: 1.0
-  label_drop_prob: 0.0
   run_test_after_train: false  # eval CalFree test after training (best EMA) + log test/*
   test_max_segments: -1        # cap test segments (-1 = all)

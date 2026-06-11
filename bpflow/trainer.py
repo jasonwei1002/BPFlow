@@ -26,6 +26,7 @@ from .sampling import build_flow_matching, flow_matching_loss, sample_abp
 from .trainer_utils import (
     add_weight_decay,
     adjust_learning_rate,
+    drop_legacy_keys,
     is_main_process,
     pick_device,
     set_seed,
@@ -242,19 +243,6 @@ class Trainer:
                 cont = cont.repeat(rf, 1)
                 gender = gender.repeat(rf)
             demo = (cont, gender)
-        # optional classifier-free training: drop the ECG/PPG condition to learned
-        # null (the demo prior is intentionally left untouched).
-        p = float(self.cfg.training.label_drop_prob)
-        if p > 0.0:
-            mask = (torch.rand(cond.shape[0], device=self.device, generator=self.gen) < p)
-            null = torch.cat(
-                [
-                    self.model_raw.empty_ecg.expand(cond.shape[0], cond.shape[1], -1),
-                    self.model_raw.empty_ppg.expand(cond.shape[0], cond.shape[1], -1),
-                ],
-                dim=-1,
-            )
-            cond = torch.where(mask[:, None, None], null, cond)
         return abp, cond, demo
 
     def _train_step(self, batch) -> dict:
@@ -410,7 +398,6 @@ class Trainer:
             self.model_raw, self.fm, cond_patches,
             generator=self.gen, device=self.device,
             abp_mean=float(self.cfg.data.abp_mean), abp_std=float(self.cfg.data.abp_std),
-            cfg_strength=float(self.cfg.training.cfg_strength),
             autocast_ctx=self._autocast(),
             demo=demo,
         )
@@ -595,7 +582,7 @@ class Trainer:
                 for p, n in zip(self.model_raw.parameters(), names):
                     p.data.copy_(ckpt["model_ema"][n].to(self.device))
                 return "best/ema"
-            self.model_raw.load_state_dict(ckpt["model"])
+            self.model_raw.load_state_dict(drop_legacy_keys(ckpt["model"]))
             return "best/model"
         if self.use_ema and self.ema_params is not None:
             for p, e in zip(self.model_raw.parameters(), self.ema_params):
@@ -631,7 +618,7 @@ class Trainer:
         if not os.path.exists(path):
             return
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        self.model_raw.load_state_dict(ckpt["model"])
+        self.model_raw.load_state_dict(drop_legacy_keys(ckpt["model"]))
         if self.ema_params is not None and "model_ema" in ckpt:
             names = [n for n, _ in self.model_raw.named_parameters()]
             self.ema_params = [ckpt["model_ema"][n].to(self.device) for n in names]
@@ -661,7 +648,7 @@ class Trainer:
         if not os.path.exists(path):
             raise FileNotFoundError(f"init_from_ckpt not found: {path}")
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        self.model_raw.load_state_dict(ckpt["model"])
+        self.model_raw.load_state_dict(drop_legacy_keys(ckpt["model"]))
         if self.ema_params is not None and "model_ema" in ckpt:
             names = [n for n, _ in self.model_raw.named_parameters()]
             self.ema_params = [ckpt["model_ema"][n].to(self.device) for n in names]

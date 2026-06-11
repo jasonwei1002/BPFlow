@@ -132,8 +132,6 @@ class TrainingConfig:
     # FRESH run, then train normally (optimizer/epoch/step reset). Used by the
     # finetune flow; ignored when resuming an interrupted run. Empty = off.
     init_from_ckpt: str = ""
-    cfg_strength: float = 1.0  # >1 enables classifier-free guidance at sampling
-    label_drop_prob: float = 0.0  # prob of dropping the condition to null (CFG train)
     # After training finishes, evaluate on the CalFree test set (best-by-val EMA
     # weights), log test/* to SwanLab, and write test_metrics.json. DDP-sharded.
     run_test_after_train: bool = False
@@ -206,6 +204,17 @@ def load_config(config_path: Optional[str] = None, overrides: Optional[dict] = N
     return cfg  # type: ignore[return-value]
 
 
+def drop_legacy_keys(state: dict) -> dict:
+    """Drop removed-feature keys so pre-removal checkpoints still load.
+
+    The classifier-free-guidance null conditions (``empty_ecg``/``empty_ppg``) were
+    removed; an old checkpoint carries them as now-unexpected keys. They were a
+    no-op (zero contribution), so dropping them loses nothing. Everything else is
+    left untouched, so a genuinely incompatible checkpoint still fails loudly.
+    """
+    return {k: v for k, v in state.items() if not k.startswith("empty_")}
+
+
 # ----------------------------------------------------------------------------
 # Reproducibility / device / optimizer helpers
 # ----------------------------------------------------------------------------
@@ -235,14 +244,11 @@ def add_weight_decay(model: torch.nn.Module, weight_decay: float = 0.0, skip_lis
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # 1-D params (norms), biases, and the learned null conditions
-        # (empty_ecg / empty_ppg) are excluded from weight decay; decaying the
-        # null conditions would weaken classifier-free guidance.
+        # 1-D params (norms) and biases are excluded from weight decay.
         if (
             len(param.shape) == 1
             or name.endswith(".bias")
             or name in skip_list
-            or name.startswith("empty_")
         ):
             no_decay.append(param)
         else:

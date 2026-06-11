@@ -214,8 +214,7 @@ def kshot_evaluate(
             pred = sample_abp(
                 model_raw, fm, cond_q.to(device),
                 generator=generator, device=device,
-                abp_mean=float(d.abp_mean), abp_std=float(d.abp_std),
-                cfg_strength=float(cfg.training.cfg_strength), context=phi,
+                abp_mean=float(d.abp_mean), abp_std=float(d.abp_std), context=phi,
             )
             preds.append(pred)
             gts.append(raw_q)

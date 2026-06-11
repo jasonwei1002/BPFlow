@@ -45,7 +45,6 @@ def sample_abp(
     device: torch.device,
     abp_mean: float,
     abp_std: float,
-    cfg_strength: float = 1.0,
     autocast_ctx=None,
     demo=None,
     context=None,
@@ -55,8 +54,7 @@ def sample_abp(
     Assumes ``model`` is the raw (unwrapped) model already in the desired
     eval/param state. ``demo`` is an optional (cont, gender) demographics sample
     and ``context`` the optional per-subject ANIL context (already adapted),
-    both used as global priors. The null condition is only built when CFG is
-    active (``cfg_strength > 1``); otherwise ``ode_wrapper`` ignores it.
+    both used as global priors.
     """
     cond_patches = cond_patches.to(device)
     demo = _demo_to(demo, device)
@@ -64,14 +62,13 @@ def sample_abp(
         context = context.to(device)
     bs = cond_patches.shape[0]
     conditions = model.preprocess_conditions(cond_patches, demo, context)
-    empty = model.get_empty_conditions(bs, demo, context) if cfg_strength > 1.0 else conditions
     x0 = (
         torch.randn(
             bs, model.latent_seq_len, model.latent_dim, generator=generator, device=device
         )
         * fm.noise_scale
     )
-    fn = lambda t, x: model.ode_wrapper(t, x, conditions, empty, cfg_strength)
+    fn = lambda t, x: model.ode_wrapper(t, x, conditions)
     with (autocast_ctx if autocast_ctx is not None else nullcontext()):
         x1 = fm.to_data(fn, x0)
     wave = unpatchify(x1).float().cpu()
