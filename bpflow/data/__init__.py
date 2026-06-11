@@ -11,7 +11,6 @@ from .transforms import (
     destandardize_abp,
     patchify,
     standardize_abp,
-    standardize_bp,
     standardize_demo,
     unpatchify,
 )
@@ -40,6 +39,5 @@ __all__ = [
     "unpatchify",
     "build_cond_patches",
     "standardize_demo",
-    "standardize_bp",
     "DEMO_CONT_DIM",
 ]

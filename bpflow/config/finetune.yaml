@@ -1,0 +1,21 @@
+# Finetune config: adapt a pretrained model to the CalFree domain.
+# Inherits the full gpu.yaml architecture + hyperparameters (lr, epochs, etc.).
+# The CalFree `test_npy` is split 8:1:1 (per-segment, fixed seed) into
+# train/val/test; finetune runs on the 80% train, validates on the 10% val,
+# and the post-train test runs on the held-out 10% test.
+#
+# Use (pass the pretrained checkpoint explicitly):
+#   CKPT=output/<pretrain_ts>/checkpoint_best.pth bash finetune.sh
+#   python -m bpflow.train --config bpflow/config/finetune.yaml --init-ckpt <pretrained>
+
+_base_: gpu.yaml
+
+data:
+  finetune: true            # split test_npy (CalFree) 8:1:1 into train/val/test
+  finetune_val_fraction: 0.1
+  finetune_test_fraction: 0.1
+
+training:
+  run_test_after_train: true # after finetune, eval the held-out 10% test split + log test/*
+  test_max_segments: -1      # all test-split segments (DDP-sharded)
+  # init_from_ckpt is supplied at launch via finetune.sh / --init-ckpt

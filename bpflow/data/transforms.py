@@ -55,26 +55,6 @@ def build_cond_patches(
     return torch.cat([ecg_p, ppg_p], dim=-1)  # (..., N, 2P)
 
 
-def standardize_bp(
-    sbp: torch.Tensor,
-    dbp: torch.Tensor,
-    *,
-    sbp_mean: float,
-    sbp_std: float,
-    dbp_mean: float,
-    dbp_std: float,
-) -> torch.Tensor:
-    """Z-score cuff calibration scalars into (..., 2) = [SBP_z, DBP_z].
-
-    These are the CALIBRATION cuff readings carried by the support set, never
-    the query segment's own SBP/DBP (that is the evaluation target and would
-    leak). Fixed global constants, like ABP/demographics — never per-sample.
-    """
-    s = (sbp - sbp_mean) / sbp_std
-    d = (dbp - dbp_mean) / dbp_std
-    return torch.stack([s, d], dim=-1)
-
-
 # Continuous demo channels, in the fixed order the model's DemoEncoder expects.
 DEMO_CONT_DIM = 5  # [age, height, weight, bmi, body_missing_flag]
 

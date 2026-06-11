@@ -105,18 +105,13 @@ def run_inference(args: argparse.Namespace) -> None:
 
     preds, gts = [], []
     use_demo = bool(cfg.model.use_demo)
-    use_calib = bool(cfg.model.use_calib)
     desc = f"infer (rank0 shard of {total})" if distributed else f"infer ({total})"
     for batch in tqdm(loader, desc=desc, disable=not is_main):
         demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
-        calib = (
-            (batch["calib_cond"], batch["calib_bp"], batch["calib_mask"])
-            if use_calib and "calib_cond" in batch else None
-        )
         out = sample_abp(
             model, fm, batch["cond_patches"], generator=gen, device=device,
             abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std), cfg_strength=cfg_s,
-            demo=demo, calib=calib,
+            demo=demo,
         )
         preds.append(out.cpu())
         gts.append(batch["abp_raw"].cpu())

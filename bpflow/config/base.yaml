@@ -11,7 +11,6 @@ model:
   mlp_ratio: 4.0
   joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
   use_demo: false           # condition on demographics (age/gender/height/weight/bmi)
-  use_calib: false          # K-shot cuff-calibration personalization (zero-init prior)
 
 data:
   train_npy: rawdata/pulsedb/Train_Subset.npy
@@ -37,16 +36,6 @@ data:
   demo_weight_std: 11.66
   demo_bmi_mean: 22.92
   demo_bmi_std: 3.44
-  # K-shot cuff-calibration (model.use_calib). Support = K same-subject segments
-  # carrying ECG/PPG + cuff [SBP,DBP]; needs subject_id CSV for every split.
-  # Train randomizes K in [0,calib_k_max] (K=0 == calibration-free); val/test fix
-  # calib_eval_k. BP z-score constants from the full train split.
-  calib_k_max: 10
-  calib_eval_k: 10
-  bp_sbp_mean: 118.60
-  bp_sbp_std: 21.03
-  bp_dbp_mean: 61.86
-  bp_dbp_std: 12.65
 
 sampling:
   prediction_type: v        # shared train (loss target) + infer (ODE)

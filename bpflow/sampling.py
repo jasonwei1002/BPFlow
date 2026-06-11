@@ -35,14 +35,6 @@ def _demo_to(demo, device: torch.device):
     return cont.to(device), gender.to(device)
 
 
-def _calib_to(calib, device: torch.device):
-    """Move a (cond, bp, mask) calibration support sample to ``device``, or None."""
-    if calib is None:
-        return None
-    cond, bp, mask = calib
-    return cond.to(device), bp.to(device), mask.to(device)
-
-
 @torch.no_grad()
 def sample_abp(
     model: torch.nn.Module,
@@ -56,22 +48,19 @@ def sample_abp(
     cfg_strength: float = 1.0,
     autocast_ctx=None,
     demo=None,
-    calib=None,
 ) -> torch.Tensor:
     """Sample ABP waveforms (mmHg, shape (B, L)) from ECG+PPG condition patches.
 
     Assumes ``model`` is the raw (unwrapped) model already in the desired
     eval/param state. ``demo`` is an optional (cont, gender) demographics sample
-    and ``calib`` an optional (cond, bp, mask) calibration support sample, both
-    used as global priors. The null condition is only built when CFG is active
+    used as a global prior. The null condition is only built when CFG is active
     (``cfg_strength > 1``); otherwise ``ode_wrapper`` ignores it.
     """
     cond_patches = cond_patches.to(device)
     demo = _demo_to(demo, device)
-    calib = _calib_to(calib, device)
     bs = cond_patches.shape[0]
-    conditions = model.preprocess_conditions(cond_patches, demo, calib)
-    empty = model.get_empty_conditions(bs, demo, calib) if cfg_strength > 1.0 else conditions
+    conditions = model.preprocess_conditions(cond_patches, demo)
+    empty = model.get_empty_conditions(bs, demo) if cfg_strength > 1.0 else conditions
     x0 = (
         torch.randn(
             bs, model.latent_seq_len, model.latent_dim, generator=generator, device=device
@@ -97,16 +86,14 @@ def flow_matching_loss(
     prediction_type: str,
     loss_type: str,
     demo=None,
-    calib=None,
 ) -> torch.Tensor:
     """One flow-matching training step: noise -> predict -> loss (mean scalar).
 
     ``model`` is called for the forward, so pass the DDP-wrapped module when
     training under DDP (gradient sync) and the raw module otherwise. ``demo`` is
-    an optional (cont, gender) demographics sample and ``calib`` an optional
-    (cond, bp, mask) calibration support sample (both already on the right device).
+    an optional (cont, gender) demographics sample (already on the right device).
     """
     t = log_normal_sample(abp_patches, generator=generator, m=logit_mean, s=logit_scale)
     x0, x1, xt, t_sh = fm.get_x0_xt_c(abp_patches, t, generator=generator)
-    pred = model(xt, cond_patches, t_sh, demo, calib)
+    pred = model(xt, cond_patches, t_sh, demo)
     return fm.loss(prediction_type, loss_type, pred, x0, xt, x1, t_sh).mean()

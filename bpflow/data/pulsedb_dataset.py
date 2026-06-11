@@ -29,7 +29,6 @@ from .transforms import (
     build_cond_patches,
     patchify,
     standardize_abp,
-    standardize_bp,
     standardize_demo,
 )
 
@@ -63,10 +62,9 @@ class PulseDBDataset(Dataset):
         cond_recenter: bool = True,
         use_demo: bool = False,
         demo_consts: Optional[Dict[str, float]] = None,
-        use_calib: bool = False,
-        calib_k_max: int = 10,
-        calib_eval_k: int = 10,
-        bp_consts: Optional[Dict[str, float]] = None,
+        finetune: bool = False,
+        finetune_val_fraction: float = 0.1,
+        finetune_test_fraction: float = 0.1,
     ) -> None:
         super().__init__()
         if split not in ("train", "val", "test"):
@@ -78,19 +76,24 @@ class PulseDBDataset(Dataset):
             raise ValueError(f"expected (N,3,L) array at {npy_path}, got {self.arr.shape}")
         total = self.arr.shape[0]
 
-        # Read the sibling CSV once if subject-split, demographics, or calibration
-        # need it. Calibration needs subject_id for EVERY split (test included) to
-        # sample same-subject support, plus the sbp/dbp cuff columns.
-        need_subject = (split in ("train", "val") and split_mode == "subject") or use_calib
+        # Read the sibling CSV once if subject-split or demographics need it.
+        # Finetune never uses the subject split (it does a 3-way segment split).
+        need_subject = (not finetune) and split in ("train", "val") and split_mode == "subject"
         frame = None
-        if need_subject or use_demo or use_calib:
-            frame = self._read_csv(npy_path, total, need_subject, use_demo, use_calib)
+        if need_subject or use_demo:
+            frame = self._read_csv(npy_path, total, need_subject, use_demo)
 
-        self.indices = self._compute_indices(
-            split, total, split_mode, split_seed, val_fraction, frame
-        )
+        if finetune:
+            self.indices = self._compute_finetune_indices(
+                split, total, split_seed, finetune_val_fraction, finetune_test_fraction
+            )
+        else:
+            self.indices = self._compute_indices(
+                split, total, split_mode, split_seed, val_fraction, frame
+            )
 
         self.split = split
+        self.finetune = finetune
         self.patch_size = patch_size
         self.ecg_channel = ecg_channel
         self.ppg_channel = ppg_channel
@@ -108,32 +111,26 @@ class PulseDBDataset(Dataset):
             assert frame is not None
             self._build_demo(frame, demo_consts or {})
 
-        self.use_calib = use_calib
-        if use_calib:
-            assert frame is not None
-            self._build_calib_index(frame, calib_k_max, calib_eval_k, bp_consts or {})
-
+        mode = "finetune-3way" if finetune else split_mode
         log.info(
             "PulseDBDataset[%s] %s: %d/%d segments (mode=%s, seed=%d, val_frac=%.2f, demo=%s)",
-            split, npy_path, len(self.indices), total, split_mode, split_seed,
+            split, npy_path, len(self.indices), total, mode, split_seed,
             val_fraction, use_demo,
         )
 
     # -- setup helpers -----------------------------------------------------
     @staticmethod
-    def _read_csv(npy_path: str, total: int, need_subject: bool, use_demo: bool, use_calib: bool):
+    def _read_csv(npy_path: str, total: int, need_subject: bool, use_demo: bool):
         import pandas as pd
 
         csv_path = _csv_path_for(npy_path)
         if not os.path.exists(csv_path):
             raise FileNotFoundError(
-                f"need {csv_path} for subject-split/demographics/calibration, but it is "
-                "missing. Use split_mode='segment', use_demo=false, use_calib=false, or "
+                f"need {csv_path} for subject-split/demographics, but it is "
+                "missing. Use split_mode='segment', use_demo=false, or "
                 "provide the CSV."
             )
         cols = ["subject_id"] if need_subject else []
-        if use_calib:
-            cols += ["sbp", "dbp"]
         if use_demo:
             cols += _DEMO_COLS
         frame = pd.read_csv(csv_path, usecols=cols)
@@ -165,6 +162,33 @@ class PulseDBDataset(Dataset):
         chosen = order[:n_train] if split == "train" else order[n_train:]
         return np.sort(chosen)
 
+    @staticmethod
+    def _compute_finetune_indices(split, total, split_seed, val_fraction, test_fraction):
+        """Deterministic 3-way per-segment split of a single npy (train/val/test).
+
+        One fixed-seed shuffle, then contiguous slices: test = last
+        ``test_fraction``, val = the ``val_fraction`` before it, train = the
+        rest. The same seed across the three build calls makes the partition
+        consistent and non-overlapping (no segment is in two splits).
+        """
+        order = np.arange(total)
+        np.random.default_rng(split_seed).shuffle(order)
+        n_test = int(test_fraction * total)
+        n_val = int(val_fraction * total)
+        n_train = total - n_val - n_test
+        if n_train <= 0:
+            raise ValueError(
+                f"finetune split leaves no train: total={total}, val_frac={val_fraction}, "
+                f"test_frac={test_fraction}"
+            )
+        if split == "train":
+            chosen = order[:n_train]
+        elif split == "val":
+            chosen = order[n_train:n_train + n_val]
+        else:  # test
+            chosen = order[n_train + n_val:]
+        return np.sort(chosen)
+
     def _build_demo(self, frame, demo_consts: Dict[str, float]) -> None:
         def col(name: str) -> torch.Tensor:
             return torch.tensor(frame[name].to_numpy(), dtype=torch.float32)
@@ -175,60 +199,6 @@ class PulseDBDataset(Dataset):
         )
         self.demo_cont = cont[self.indices]  # (n, 5)
         self.demo_gender = gender[self.indices]  # (n,)
-
-    def _build_calib_index(
-        self, frame, calib_k_max: int, calib_eval_k: int, bp_consts: Dict[str, float]
-    ) -> None:
-        """Precompute the same-subject calibration index.
-
-        Stores z-scored [SBP, DBP] aligned to ``self.indices`` and a subject ->
-        local-index map so ``__getitem__`` can draw K same-subject support
-        segments. Train randomizes K per sample in [0, calib_k_max]; val/test use
-        a fixed calib_eval_k.
-        """
-        self.calib_k_max = calib_k_max
-        self.calib_eval_k = calib_eval_k
-        self._calib_random_k = self.split == "train"
-        sbp = torch.tensor(frame["sbp"].to_numpy(), dtype=torch.float32)
-        dbp = torch.tensor(frame["dbp"].to_numpy(), dtype=torch.float32)
-        bp_z = standardize_bp(sbp, dbp, **bp_consts)  # (total, 2)
-        self.bp_z = bp_z[self.indices]  # (n, 2), aligned to self.indices
-        sids_local = frame["subject_id"].to_numpy()[self.indices]
-        self._sids_local = sids_local
-        subj_to_local: Dict[object, list] = {}
-        for local_i, s in enumerate(sids_local):
-            subj_to_local.setdefault(s, []).append(local_i)
-        self._subj_to_local = {
-            s: np.asarray(v, dtype=np.int64) for s, v in subj_to_local.items()
-        }
-
-    def _build_calib(self, i: int) -> Dict[str, torch.Tensor]:
-        """K-shot calibration support for query local index ``i``.
-
-        K same-subject segments' ECG/PPG condition patches + cuff [SBP, DBP],
-        with a validity mask. Fixed ``calib_k_max`` slots (zero-padded); the query
-        itself is excluded and its own SBP/DBP never enters the input. Train
-        randomizes the count, val/test fix it to ``calib_eval_k``.
-        """
-        k_max = self.calib_k_max
-        cand = self._subj_to_local[self._sids_local[i]]
-        cand = cand[cand != i]  # exclude the query segment itself
-        k = int(torch.randint(0, k_max + 1, (1,)).item()) if self._calib_random_k else self.calib_eval_k
-        k = min(k, k_max, len(cand))
-        n_tokens = self.arr.shape[2] // self.patch_size
-        cond = torch.zeros(k_max, n_tokens, 2 * self.patch_size, dtype=torch.float32)
-        bp = torch.zeros(k_max, 2, dtype=torch.float32)
-        mask = torch.zeros(k_max, dtype=torch.float32)
-        if k > 0:
-            sel = cand[torch.randperm(len(cand))[:k].numpy()]
-            for slot, local_j in enumerate(sel):
-                row = np.asarray(self.arr[self.indices[local_j]]).astype(np.float32)
-                ecg = torch.from_numpy(row[self.ecg_channel])
-                ppg = torch.from_numpy(row[self.ppg_channel])
-                cond[slot] = build_cond_patches(ecg, ppg, self.patch_size, self.cond_recenter)
-                bp[slot] = self.bp_z[local_j]
-                mask[slot] = 1.0
-        return {"calib_cond": cond, "calib_bp": bp, "calib_mask": mask}
 
     # -- access ------------------------------------------------------------
     def __len__(self) -> int:
@@ -255,24 +225,23 @@ class PulseDBDataset(Dataset):
             assert self.demo_cont is not None and self.demo_gender is not None
             out["demo_cont"] = self.demo_cont[i]      # (5,)
             out["demo_gender"] = self.demo_gender[i]  # () long
-        if self.use_calib:
-            out.update(self._build_calib(i))  # calib_cond/calib_bp/calib_mask
         return out
 
 
 def build_dataset(cfg, split: str) -> PulseDBDataset:
     """Build a PulseDBDataset for ``split`` from a config object."""
     d = cfg.data
-    npy_path = str(d.test_npy) if split == "test" else str(d.train_npy)
+    finetune = bool(getattr(d, "finetune", False))
+    # Finetune splits the CalFree `test_npy` 3 ways, so every split reads it.
+    if finetune:
+        npy_path = str(d.test_npy)
+    else:
+        npy_path = str(d.test_npy) if split == "test" else str(d.train_npy)
     demo_consts = {
         "age_mean": float(d.demo_age_mean), "age_std": float(d.demo_age_std),
         "height_mean": float(d.demo_height_mean), "height_std": float(d.demo_height_std),
         "weight_mean": float(d.demo_weight_mean), "weight_std": float(d.demo_weight_std),
         "bmi_mean": float(d.demo_bmi_mean), "bmi_std": float(d.demo_bmi_std),
-    }
-    bp_consts = {
-        "sbp_mean": float(d.bp_sbp_mean), "sbp_std": float(d.bp_sbp_std),
-        "dbp_mean": float(d.bp_dbp_mean), "dbp_std": float(d.bp_dbp_std),
     }
     return PulseDBDataset(
         npy_path,
@@ -291,8 +260,7 @@ def build_dataset(cfg, split: str) -> PulseDBDataset:
         cond_recenter=bool(d.cond_recenter),
         use_demo=bool(cfg.model.use_demo),
         demo_consts=demo_consts,
-        use_calib=bool(cfg.model.use_calib),
-        calib_k_max=int(d.calib_k_max),
-        calib_eval_k=int(d.calib_eval_k),
-        bp_consts=bp_consts,
+        finetune=finetune,
+        finetune_val_fraction=float(getattr(d, "finetune_val_fraction", 0.1)),
+        finetune_test_fraction=float(getattr(d, "finetune_test_fraction", 0.1)),
     )

@@ -15,24 +15,27 @@ There is no `README.md`, `pyproject.toml`, or packaging — the project runs as 
 # This IS the test suite: overfits a few real segments, asserts loss collapse + recon improvement.
 python -m bpflow.smoke_test                       # uses bpflow/config/smoke.yaml
 python -m bpflow.smoke_test --n-steps 600 --n-samples 8
-python -m bpflow.smoke_test --config bpflow/config/smoke_calib.yaml   # exercises the K-shot calibration path
 
-# Train (single-node, multi-GPU via torchrun). NPROC=gpu → all visible GPUs.
-# gpu.yaml runs a full-CalFree test pass after training (best EMA) and logs test/* to SwanLab.
+# Pretrain (single-node, multi-GPU via torchrun). --nproc <gpu|N> picks processes
+# ('gpu' = all visible GPUs, default). Pretraining does NOT touch CalFree (no
+# post-train test); CalFree is reserved for finetune.
 bash train.sh                                     # all GPUs, bpflow/config/gpu.yaml
-NPROC=1 bash train.sh                             # single GPU/CPU
-CUDA_VISIBLE_DEVICES=0,1 bash train.sh            # pick GPUs
+bash train.sh --nproc 1                           # single GPU/CPU
+CUDA_VISIBLE_DEVICES=0,1 bash train.sh --nproc 2  # pick GPUs
 bash train.sh --config bpflow/config/other.yaml   # override (args pass through to bpflow.train)
 python -m bpflow.train --config bpflow/config/gpu.yaml   # no torchrun (single process)
 
-# Inference / evaluation on the CalFree test set. CKPT is REQUIRED (runs live under output/<timestamp>/).
-CKPT=output/<timestamp>/checkpoint_best.pth bash infer.sh
-NPROC=4 CKPT=... bash infer.sh
-python -m bpflow.infer --config bpflow/config/gpu.yaml --ckpt <path> --split test --num -1 --use-ema
+# Finetune a pretrained model on the CalFree domain. CalFree (test_npy) is split 8:1:1
+# (per-segment, fixed seed) into train/val/test; finetunes on 80%, then auto-tests on the
+# held-out 10%. Args: <checkpoint> [--nproc N] [extra args]; new output/<ts>/.
+bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth            # all GPUs
+bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4  # 4 GPUs
+python -m bpflow.train --config bpflow/config/finetune.yaml --init-ckpt <pretrained>
 
-# K-shot calibration sweep (needs use_calib + a calib-trained ckpt). Nested K, shared noise per batch;
-# K=0 == calibration-free baseline. Writes kshot_sweep.json + a K-vs-error curve.
-python -m bpflow.kshot_sweep --config bpflow/config/gpu.yaml --ckpt <best> --use-ema --ks 0,1,3,5,10 --num 2000 --plot
+# Inference / evaluation on the CalFree test set. Args: <checkpoint> [--nproc N] [extra args].
+bash infer.sh output/<timestamp>/checkpoint_best.pth                 # all GPUs
+bash infer.sh output/<timestamp>/checkpoint_best.pth --nproc 4       # 4 GPUs
+python -m bpflow.infer --config bpflow/config/gpu.yaml --ckpt <path> --split test --num -1 --use-ema
 
 # Pull SwanLab metrics for the latest run (skill: swanlab-fetch)
 python ~/.claude/skills/swanlab-fetch/scripts/fetch_swanlab.py --latest
@@ -49,11 +52,9 @@ bash gitpull.sh
        ├─ standardize_abp     data/transforms.py       — clip[20,250] THEN global z-score (mean 81.94/std 24.43)
        ├─ patchify ABP        → abp_patches (N=125, P=10)
        ├─ build_cond_patches  → cond_patches (N, 2P) channel-major [ECG(P) | PPG(P)], ECG/PPG recentered −0.5
-       ├─ standardize_demo    (use_demo) age/gender/height/weight/bmi from sibling CSV → demo_cont(5) + gender idx
-       └─ _build_calib        (use_calib) K same-subject support segs → calib_cond(K,N,2P) + calib_bp(K,2 z-scored SBP/DBP) + calib_mask(K)
+       └─ standardize_demo    (use_demo) age/gender/height/weight/bmi from sibling CSV → demo_cont(5) + gender idx
   └─ BPFlowModel              model/networks.py        — 3-stream joint DiT
        ├─ DemoEncoder         (use_demo) demo → global_c add-on; zero-init last layer → starts as a no-op
-       ├─ CalibrationEncoder  (use_calib) K-shot cuff support → masked-mean → global_c add-on; zero-init → no-op start
        ├─ joint_blocks×8      model/blocks.py BPJointBlock — ABP+ECG+PPG attend jointly, shared RoPE grid
        ├─ fused_blocks×4      latent-only MMDitSingleBlock
        └─ final_layer         → predicts flow (B,N,P)
@@ -70,10 +71,10 @@ Three glue modules tie it together and must stay consistent:
 ## Config system
 
 OmegaConf structured config with a `_base_:` include chain (resolved in `trainer_utils._merge_base`):
-- **`base.yaml`** — architecture, on-disk shapes, normalization constants (ABP + demographics + `bp_*` for calibration), prediction_type. Anything here affects **checkpoint compatibility** (`infer.py` asserts `abp_mean`/`abp_std` match the checkpoint). Defaults to `split_mode: segment`, `use_demo: false`, `use_calib: false`.
-- **`gpu.yaml`** (inherits `base.yaml`) — real training (epochs 200, per-GPU batch 128, lr 3e-4, plateau lr-decay + early stop, SwanLab cloud). Flips on **`split_mode: subject`**, **`use_demo: true`**, and **`use_calib: true`** — so real training needs the sibling CSV (see gotchas). Also `val_max_batches: -1` (full DDP-sharded val) and `run_test_after_train: true` (auto CalFree test after training).
-- **`smoke.yaml`** (inherits `base.yaml`) — tiny CPU model for the smoke test (not a real model). Inherits segment split + no demo/calib, so the smoke test runs from the `.npy` alone (no CSV).
-- **`smoke_calib.yaml`** (inherits `smoke.yaml`) — same tiny model with `use_calib: true` (k_max 4); exercises the calibration path on CPU. Needs the sibling `Train_Subset.csv` (subject_id + sbp/dbp).
+- **`base.yaml`** — architecture, on-disk shapes, normalization constants (ABP + demographics), prediction_type. Anything here affects **checkpoint compatibility** (`infer.py` asserts `abp_mean`/`abp_std` match the checkpoint). Defaults to `split_mode: segment`, `use_demo: false`.
+- **`gpu.yaml`** (inherits `base.yaml`) — real **pretraining** (epochs 200, per-GPU batch 128, lr 3e-4, plateau lr-decay + early stop, SwanLab cloud). Uses `split_mode: segment` (random per-segment train/val) and flips on **`use_demo: true`** — so real training needs the sibling CSV for demographics (see gotchas). Also `val_max_batches: -1` (full DDP-sharded val) and **`run_test_after_train: false`** — pretraining never touches CalFree (reserved for finetune).
+- **`finetune.yaml`** (inherits `gpu.yaml`) — domain adaptation on CalFree. Same architecture + hyperparams as gpu.yaml, but **`data.finetune: true`** splits the CalFree `test_npy` 8:1:1 (per-segment, fixed seed) into train/val/test, and **`run_test_after_train: true`** evaluates the held-out 10% test split at the end. Weights are initialized from a pretrained checkpoint via `--init-ckpt` (→ `training.init_from_ckpt`); optimizer/epoch/step reset.
+- **`smoke.yaml`** (inherits `base.yaml`) — tiny CPU model for the smoke test (not a real model). Inherits segment split + no demo, so the smoke test runs from the `.npy` alone (no CSV).
 
 ## Conventions and gotchas
 
@@ -87,10 +88,10 @@ OmegaConf structured config with a `_base_:` include chain (resolved in `trainer
 - **EMA** weights are kept on `model_raw`; validation swaps in the current EMA (`_ema_swapped`). `infer.py --use-ema` and the post-train `run_test` instead load EMA weights from disk — `run_test` loads the **best-by-val checkpoint's** EMA (`_load_eval_weights`), not the last.
 - **Flow-matching loss combos**: only `(v, v)` handles `min_sigma > 0` exactly; the other combos raise rather than train on a wrong target when `min_sigma != 0`.
 - **Data paths live under `rawdata/`** (gitignored), e.g. `rawdata/pulsedb/Train_Subset.npy`. Subject-split and demographics additionally need the **sibling CSV** `<npy_basename>.csv` (e.g. `Train_Subset.csv`), row-aligned to the npy; the dataset raises if it's missing or row counts mismatch. The CSV's `sbp/dbp/map` columns are the **label** — never read them as input.
-- **`split_mode`**: `subject` (gpu.yaml, preferred) splits train/val by the CSV's `subject_id` → subject-disjoint, matches the CalFree test setting. `segment` (base default) is a random per-segment split — the same subject lands in both train and val, so val MAE is optimistic. Either way, **CalFree (test) is the honest, subject-disjoint generalization gate.** Changing `split_mode` changes which segments are train vs val, so metrics aren't comparable across modes.
+- **`split_mode`**: `segment` (base + gpu.yaml default) is a random per-segment train/val split — the same subject lands in both train and val, so val MAE is optimistic. `subject` (optional) splits train/val by the CSV's `subject_id` → subject-disjoint, matches the CalFree test setting (needs the sibling CSV for the train/val split). Either way, **CalFree (test) is the honest, subject-disjoint generalization gate.** Changing `split_mode` changes which segments are train vs val, so metrics aren't comparable across modes.
 - **Demographics (`model.use_demo`) are a global prior, not a CFG-dropped condition.** Continuous `[age, height, weight, bmi, body_missing]` z-scored with the fixed `demo_*` config constants + a gender `nn.Embedding`, encoded by `DemoEncoder` and added to `global_c`. height/weight/bmi are ~48% jointly missing → `body_missing` flag set, NaN→0 (post-z-score mean). `label_drop_prob` CFG drop never touches demo (`get_empty_conditions` keeps `demo_emb`). The `DemoEncoder` last layer is zero-init so enabling demo starts as a no-op.
-- **K-shot cuff calibration (`model.use_calib`) is a global prior like demographics** — the downstream story is "user does K cuff calibrations, then ECG/PPG-only inference". Each query carries K same-subject support segments (`_build_calib`): their ECG/PPG `cond_patches` + the cuff `[SBP, DBP]` z-scored by the fixed `bp_*` constants — but **NOT** their ABP waveform (a cuff gives only scalars), and **NEVER** the query's own SBP/DBP (that is the eval target → leakage). `CalibrationEncoder` masked-mean-pools the K into a `global_c` add-on (zero-init → no-op start; K=0 / all-masked → calibration-free). Train randomizes K∈[0, `calib_k_max`] per sample; val/test fix `calib_eval_k`. Needs `subject_id` from the CSV for **every** split (test included). Leakage guards: support excludes the query index and stays within its subject. Full K-shot curve via `bpflow.kshot_sweep`.
-- **`run_test_after_train`** (gpu.yaml true): after training finishes (normal end or early stop — NOT a `max_steps` interrupt), `Trainer.run_test()` evaluates the **best-by-val EMA** model on the full CalFree test set (DDP-sharded, shared `_distributed_eval`), logs `test/*` to SwanLab, and writes `output/<ts>/test_metrics.json`. It runs inside `train()` before `close()`, so it lands in the same SwanLab run. `test_max_segments > 0` caps it. In-train test reports at the configured `calib_eval_k`; the K=0 baseline comes from `kshot_sweep`.
+- **`run_test_after_train`** (gpu.yaml **false**, finetune.yaml **true**): after training finishes (normal end or early stop — NOT a `max_steps` interrupt), `Trainer.run_test()` evaluates the **best-by-val EMA** model on the `test` split (DDP-sharded, shared `_distributed_eval`), logs `test/*` to SwanLab, and writes `output/<ts>/test_metrics.json`. It runs inside `train()` before `close()`, so it lands in the same SwanLab run. `test_max_segments > 0` caps it. For finetune the `test` split is the held-out 10% of CalFree; pretraining leaves it off so CalFree is untouched.
+- **Finetune flow (`data.finetune: true`)** repurposes the CalFree `test_npy`: a fixed-seed **per-segment** 8:1:1 split (`finetune_val_fraction`/`finetune_test_fraction`, default 0.1/0.1) makes train/val/**test** all read CalFree, non-overlapping. `split_mode` is ignored (no subject split). The pretrained model is loaded via **`--init-ckpt`** → `training.init_from_ckpt` (`Trainer._maybe_init_from_ckpt`): it copies `model` (+ `model_ema`) weights only, then trains fresh (optimizer/epoch/step reset). Skipped when resuming an interrupted run. ⚠️ The split is per-segment, so the same subject can appear in both finetune-train and the final test → that test number is optimistic, not subject-disjoint.
 
 ## Git
 

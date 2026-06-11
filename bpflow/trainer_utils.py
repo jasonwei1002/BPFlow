@@ -31,10 +31,6 @@ class ModelConfig:
     mlp_ratio: float = 4.0
     joint_depth: int = 8  # number of 3-stream (ABP+ECG+PPG) joint-attention layers
     use_demo: bool = False  # condition on demographics (age/gender/height/weight/bmi)
-    # K-shot cuff-calibration personalization: encode a same-subject support set
-    # (ECG/PPG + cuff [SBP, DBP] scalars) into a global prior. Zero-init -> no-op
-    # start. Needs data.split providing subject_id (any split) + data.calib_* .
-    use_calib: bool = False
 
 
 @dataclass
@@ -69,17 +65,13 @@ class DataConfig:
     demo_weight_std: float = 11.66
     demo_bmi_mean: float = 22.92
     demo_bmi_std: float = 3.44
-    # K-shot cuff-calibration (model.use_calib). The support set is K same-subject
-    # segments, each carrying ECG/PPG + cuff [SBP, DBP]. Needs subject_id from the
-    # sibling CSV for EVERY split (test included). Train randomizes K in [0,
-    # calib_k_max] per sample (K=0 == calibration-free); val/test use a fixed
-    # calib_eval_k. BP z-score constants are from the full train split.
-    calib_k_max: int = 10
-    calib_eval_k: int = 10
-    bp_sbp_mean: float = 118.60
-    bp_sbp_std: float = 21.03
-    bp_dbp_mean: float = 61.86
-    bp_dbp_std: float = 12.65
+    # Finetune mode: ignore train_npy/split_mode and instead split the CalFree
+    # `test_npy` into train/val/test by a fixed-seed per-segment partition
+    # (8:1:1 by default). Used by the finetune flow to adapt a pretrained model
+    # to the CalFree domain and report on its own held-out test split.
+    finetune: bool = False
+    finetune_val_fraction: float = 0.1
+    finetune_test_fraction: float = 0.1
 
 
 @dataclass
@@ -125,6 +117,10 @@ class TrainingConfig:
     use_compile: bool = True  # torch.compile the training-forward path (CUDA only)
     max_steps: int = -1  # cap total steps (smoke); -1 = unlimited
     repeat_factor: int = 1  # repeat each batch along B (smoke overfit aid)
+    # Initialize model (+ EMA) weights from this checkpoint at the start of a
+    # FRESH run, then train normally (optimizer/epoch/step reset). Used by the
+    # finetune flow; ignored when resuming an interrupted run. Empty = off.
+    init_from_ckpt: str = ""
     cfg_strength: float = 1.0  # >1 enables classifier-free guidance at sampling
     label_drop_prob: float = 0.0  # prob of dropping the condition to null (CFG train)
     # After training finishes, evaluate on the CalFree test set (best-by-val EMA

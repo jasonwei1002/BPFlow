@@ -45,7 +45,6 @@ class BPConditions:
     ppg_seq: torch.Tensor  # (B, N, hidden)
     pooled: torch.Tensor  # (B, hidden)
     demo_emb: Optional[torch.Tensor] = None  # (B, hidden) global demo prior, or None
-    calib_emb: Optional[torch.Tensor] = None  # (B, hidden) calibration prior, or None
 
 
 class DemoEncoder(nn.Module):
@@ -65,39 +64,6 @@ class DemoEncoder(nn.Module):
     def forward(self, cont: torch.Tensor, gender: torch.Tensor) -> torch.Tensor:
         h = self.cont_proj(cont) + self.gender_emb(gender)  # (B, hidden)
         return self.mlp(h)
-
-
-# A calibration support sample: (cond (B,K,N,2P), bp (B,K,2), mask (B,K)).
-CalibInput = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-
-
-class CalibrationEncoder(nn.Module):
-    """Encode a K-shot cuff-calibration support set into a global conditioning vector.
-
-    Each support segment contributes a shallow ECG/PPG embedding (a per-token
-    linear pooled over time) fused with its cuff [SBP, DBP] z-scored scalars. The
-    K per-segment vectors are mean-pooled over the valid (masked) support, so the
-    encoder is permutation-invariant and handles any K in [0, k_max]; K=0 (all
-    masked) yields a zero vector == calibration-free. The final layer is zero-init
-    so calibration starts as a no-op (global_c unchanged) and is learned in.
-    """
-
-    def __init__(self, hidden_dim: int, patch_size: int) -> None:
-        super().__init__()
-        self.wave_proj = nn.Linear(2 * patch_size, hidden_dim)  # per-token cond -> H
-        self.bp_proj = nn.Linear(2, hidden_dim)  # [SBP, DBP]_z -> H
-        self.fuse = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
-        self.out = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
-
-    def forward(
-        self, cond: torch.Tensor, bp: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
-        # cond (B,K,N,2P); bp (B,K,2); mask (B,K)
-        wave = self.wave_proj(cond).mean(dim=2)  # (B,K,H) mean over tokens N
-        h = self.fuse(wave + self.bp_proj(bp))  # (B,K,H)
-        m = mask.unsqueeze(-1)  # (B,K,1)
-        pooled = (h * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)  # (B,H); K=0 -> 0
-        return self.out(pooled)  # (B,H)
 
 
 def _patch_embedder(in_dim: int, hidden: int, mlp_kernel: int) -> nn.Sequential:
@@ -128,7 +94,6 @@ class BPFlowModel(nn.Module):
         joint_depth: int,
         mlp_ratio: float = 4.0,
         use_demo: bool = False,
-        use_calib: bool = False,
     ) -> None:
         super().__init__()
         if seq_len % patch_size != 0:
@@ -177,10 +142,6 @@ class BPFlowModel(nn.Module):
         self.use_demo = use_demo
         if use_demo:
             self.demo_encoder = DemoEncoder(hidden_dim)
-        # optional K-shot cuff-calibration encoder (zero-init -> no-op start)
-        self.use_calib = use_calib
-        if use_calib:
-            self.calib_encoder = CalibrationEncoder(hidden_dim, patch_size)
 
         self.initialize_weights()
         latent_rot = compute_rope_rotations(self.latent_seq_len, head_dim, 10000, device="cpu")
@@ -217,10 +178,6 @@ class BPFlowModel(nn.Module):
             # zero-init the encoder output so demographics start as a no-op
             nn.init.constant_(self.demo_encoder.mlp[-1].weight, 0)
             nn.init.constant_(self.demo_encoder.mlp[-1].bias, 0)
-        if self.use_calib:
-            # zero-init the encoder output so calibration starts as a no-op
-            nn.init.constant_(self.calib_encoder.out[-1].weight, 0)
-            nn.init.constant_(self.calib_encoder.out[-1].bias, 0)
 
     def _embed_cond(self, ecg_p: torch.Tensor, ppg_p: torch.Tensor) -> BPConditions:
         ecg_seq = self.ecg_input_proj(ecg_p)  # (B, N, H)
@@ -235,24 +192,15 @@ class BPFlowModel(nn.Module):
         cont, gender = demo
         return self.demo_encoder(cont, gender)  # (B, hidden)
 
-    def _calib_emb(self, calib: Optional[CalibInput]) -> Optional[torch.Tensor]:
-        """Encode a calibration support set, or None when calibration is off."""
-        if not self.use_calib or calib is None:
-            return None
-        cond, bp, mask = calib
-        return self.calib_encoder(cond, bp, mask)  # (B, hidden)
-
     def preprocess_conditions(
         self,
         cond_patches: torch.Tensor,
         demo: Optional[DemoInput] = None,
-        calib: Optional[CalibInput] = None,
     ) -> BPConditions:
         # cond_patches (B,N,2P) is channel-major [ECG(P), PPG(P)] -> split back.
         p = self.patch_size
         conds = self._embed_cond(cond_patches[..., :p], cond_patches[..., p:])
         conds.demo_emb = self._demo_emb(demo)
-        conds.calib_emb = self._calib_emb(calib)
         return conds
 
     def predict_flow(
@@ -262,8 +210,6 @@ class BPFlowModel(nn.Module):
         global_c = self.t_embed(t).unsqueeze(1) + conditions.pooled.unsqueeze(1)  # (B,1,H)
         if conditions.demo_emb is not None:
             global_c = global_c + conditions.demo_emb.unsqueeze(1)
-        if conditions.calib_emb is not None:
-            global_c = global_c + conditions.calib_emb.unsqueeze(1)
         ecg, ppg = conditions.ecg_seq, conditions.ppg_seq
         for block in self.joint_blocks:
             latent, ecg, ppg = block(latent, ecg, ppg, global_c, self.latent_rot)
@@ -277,10 +223,9 @@ class BPFlowModel(nn.Module):
         cond_patches: torch.Tensor,
         t: torch.Tensor,
         demo: Optional[DemoInput] = None,
-        calib: Optional[CalibInput] = None,
     ) -> torch.Tensor:
         out = self.predict_flow(
-            latent_patches, t, self.preprocess_conditions(cond_patches, demo, calib)
+            latent_patches, t, self.preprocess_conditions(cond_patches, demo)
         )
         # Keep the CFG null embeddings in the autograd graph (zero contribution)
         # so DDP sees them as used even when label_drop_prob == 0; otherwise they
@@ -291,14 +236,12 @@ class BPFlowModel(nn.Module):
         self,
         bs: int,
         demo: Optional[DemoInput] = None,
-        calib: Optional[CalibInput] = None,
     ) -> BPConditions:
         ecg_p = self.empty_ecg.expand(bs, self.latent_seq_len, -1)
         ppg_p = self.empty_ppg.expand(bs, self.latent_seq_len, -1)
         conds = self._embed_cond(ecg_p, ppg_p)
-        # Demographics and calibration are real priors, not CFG-dropped: keep them.
+        # Demographics are a real prior, not CFG-dropped: keep it.
         conds.demo_emb = self._demo_emb(demo)
-        conds.calib_emb = self._calib_emb(calib)
         return conds
 
     def ode_wrapper(

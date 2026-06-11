@@ -76,7 +76,9 @@ class Trainer:
         self.should_stop = False    # set by early stopping
         self.gen = torch.Generator(device=self.device)
         self.gen.manual_seed(int(cfg.training.seed) + self.rank)
+        self._resumed = False
         self._maybe_resume()
+        self._maybe_init_from_ckpt()
 
         self.sw = None
         self._init_swanlab()
@@ -232,19 +234,8 @@ class Trainer:
                 cont = cont.repeat(rf, 1)
                 gender = gender.repeat(rf)
             demo = (cont, gender)
-        # K-shot calibration support: a real global prior, never CFG-dropped.
-        calib = None
-        if bool(self.cfg.model.use_calib) and "calib_cond" in batch:
-            cc = batch["calib_cond"].to(self.device, non_blocking=True)   # (B,K,N,2P)
-            cbp = batch["calib_bp"].to(self.device, non_blocking=True)    # (B,K,2)
-            cm = batch["calib_mask"].to(self.device, non_blocking=True)   # (B,K)
-            if rf > 1:
-                cc = cc.repeat(rf, 1, 1, 1)
-                cbp = cbp.repeat(rf, 1, 1)
-                cm = cm.repeat(rf, 1)
-            calib = (cc, cbp, cm)
         # optional classifier-free training: drop the ECG/PPG condition to learned
-        # null (demo/calib priors are intentionally left untouched).
+        # null (the demo prior is intentionally left untouched).
         p = float(self.cfg.training.label_drop_prob)
         if p > 0.0:
             mask = (torch.rand(cond.shape[0], device=self.device, generator=self.gen) < p)
@@ -256,12 +247,12 @@ class Trainer:
                 dim=-1,
             )
             cond = torch.where(mask[:, None, None], null, cond)
-        return abp, cond, demo, calib
+        return abp, cond, demo
 
     def _train_step(self, batch) -> dict:
         lr = adjust_learning_rate(self.optimizer, self.global_step, self.cfg, self.lr_scale)
         with self._autocast():
-            abp, cond, demo, calib = self._prepare_batch(batch)
+            abp, cond, demo = self._prepare_batch(batch)
             loss = flow_matching_loss(
                 self.model, self.fm, abp, cond,
                 generator=self.gen,
@@ -270,7 +261,6 @@ class Trainer:
                 prediction_type=str(self.cfg.sampling.prediction_type),
                 loss_type=str(self.cfg.training.loss_type),
                 demo=demo,
-                calib=calib,
             )
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -405,18 +395,8 @@ class Trainer:
             return None
         return batch["demo_cont"], batch["demo_gender"]
 
-    def _batch_calib(self, batch):
-        """Pull a (cond, bp, mask) calibration sample from a batch, or None.
-
-        Left on CPU; ``sample_abp`` moves it to device. No repeat/drop here —
-        sampling uses the natural batch.
-        """
-        if not bool(self.cfg.model.use_calib) or "calib_cond" not in batch:
-            return None
-        return batch["calib_cond"], batch["calib_bp"], batch["calib_mask"]
-
     @torch.no_grad()
-    def _sample_cond(self, cond_patches: torch.Tensor, demo=None, calib=None) -> torch.Tensor:
+    def _sample_cond(self, cond_patches: torch.Tensor, demo=None) -> torch.Tensor:
         """Core sampler; assumes model is already in the desired eval/param state."""
         return sample_abp(
             self.model_raw, self.fm, cond_patches,
@@ -425,7 +405,6 @@ class Trainer:
             cfg_strength=float(self.cfg.training.cfg_strength),
             autocast_ctx=self._autocast(),
             demo=demo,
-            calib=calib,
         )
 
     @contextlib.contextmanager
@@ -474,7 +453,7 @@ class Trainer:
             if 0 < max_batches <= bi:
                 break
             pred = self._sample_cond(
-                batch["cond_patches"], self._batch_demo(batch), self._batch_calib(batch)
+                batch["cond_patches"], self._batch_demo(batch)
             )  # (b, L) mmHg on CPU
             gt = batch["abp_raw"]
             pbp, tbp = segment_bp(pred), segment_bp(gt)
@@ -648,9 +627,33 @@ class Trainer:
         self.best_val = float(ckpt.get("best_val", float("inf")))
         self.epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
         self.lr_scale = float(ckpt.get("lr_scale", 1.0))
+        self._resumed = True
         if is_main_process():
             logger.info("Resumed from %s (epoch %d, step %d, lr_scale %.4g)",
                         path, self.start_epoch, self.global_step, self.lr_scale)
+
+    def _maybe_init_from_ckpt(self) -> None:
+        """Initialize model (+ EMA) weights from a pretrained checkpoint.
+
+        For the finetune flow: load only the weights (architecture must match),
+        leaving optimizer/epoch/step/best_val fresh so training restarts from 0.
+        Skipped when resuming an interrupted run (resume already loaded weights)
+        or when ``init_from_ckpt`` is empty.
+        """
+        path = str(self.cfg.training.init_from_ckpt)
+        if not path or self._resumed:
+            return
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"init_from_ckpt not found: {path}")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        self.model_raw.load_state_dict(ckpt["model"])
+        if self.ema_params is not None and "model_ema" in ckpt:
+            names = [n for n, _ in self.model_raw.named_parameters()]
+            self.ema_params = [ckpt["model_ema"][n].to(self.device) for n in names]
+        if is_main_process():
+            has_ema = "model_ema" in ckpt
+            logger.info("Initialized weights from %s (ema=%s); optimizer/epoch/step reset",
+                        path, has_ema)
 
     def _barrier(self) -> None:
         if self.distributed:

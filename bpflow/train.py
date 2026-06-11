@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BPFlow training entrypoint")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--init-ckpt", default=None,
+        help="Pretrained checkpoint to initialize weights from (finetune); "
+             "overrides training.init_from_ckpt.",
+    )
     return parser.parse_args()
 
 
@@ -32,6 +37,8 @@ def main() -> None:
     )
     args = parse_args()
     cfg = load_config(args.config)
+    if args.init_ckpt is not None:
+        cfg.training.init_from_ckpt = args.init_ckpt
     trainer = Trainer(cfg)
     try:
         trainer.train()
