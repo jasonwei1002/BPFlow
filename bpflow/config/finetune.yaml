@@ -1,11 +1,14 @@
 # Finetune config: adapt a pretrained model to the CalFree domain.
-# Inherits the full gpu.yaml architecture + hyperparameters (lr, epochs, etc.).
-# The CalFree `test_npy` is split 8:1:1 (per-segment, fixed seed) into
-# train/val/test; finetune runs on the 80% train, validates on the 10% val,
-# and the post-train test runs on the held-out 10% test.
+# Inherits the gpu.yaml architecture; the CalFree `test_npy` is split 8:1:1
+# (per-segment, fixed seed) into train/val/test. Finetune runs on the 80% train,
+# validates on the 10% val, and the post-train test runs on the held-out 10% test.
 #
-# Use (pass the pretrained checkpoint explicitly):
-#   CKPT=output/<pretrain_ts>/checkpoint_best.pth bash finetune.sh
+# The `training` block below mirrors gpu.yaml so finetune hyperparameters can be
+# tuned independently here (e.g. a smaller lr / fewer epochs for finetuning)
+# without touching the pretraining config.
+#
+# Use (pass the pretrained checkpoint as the first positional arg):
+#   bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4
 #   python -m bpflow.train --config bpflow/config/finetune.yaml --init-ckpt <pretrained>
 
 _base_: gpu.yaml
@@ -16,6 +19,25 @@ data:
   finetune_test_fraction: 0.1
 
 training:
+  # --- finetune hyperparameters (currently identical to gpu.yaml; tune freely) ---
+  epochs: 200
+  batch_size: 128            # per-GPU (DDP global = 128 x num_gpus)
+  num_workers: 8
+  lr: 3.0e-4                 # finetune lr — often lowered (e.g. 3e-5) vs pretraining
+  warmup_steps: 1000
+  device: cuda
+  amp_dtype: bfloat16
+  use_ema: true
+  max_steps: -1
+  val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
+  val_max_batches: -1        # full val split (DDP-sharded across GPUs; -1 = all)
+  lr_patience: 5             # epochs w/o val improvement -> lr x lr_decay
+  lr_decay: 0.1
+  early_stop_patience: 10    # epochs w/o val improvement -> stop
+  use_swanlab: true
+  swanlab_project: bpflow
+  swanlab_mode: cloud        # cloud | local | offline | disabled
+  # --- finetune-specific ---
   run_test_after_train: true # after finetune, eval the held-out 10% test split + log test/*
   test_max_segments: -1      # all test-split segments (DDP-sharded)
   # init_from_ckpt is supplied at launch via finetune.sh / --init-ckpt
