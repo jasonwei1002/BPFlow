@@ -86,14 +86,6 @@ class Trainer:
 
     # -- setup -------------------------------------------------------------
     def _build_data(self) -> None:
-        # Meta-training builds its own per-subject episode loader (meta_data); the
-        # standard segment loader + val loader are unused, so skip them entirely.
-        if bool(self.cfg.meta.enabled):
-            self.train_ds = None
-            self.loader = None
-            self.sampler = None
-            self.val_loader = None
-            return
         self.train_ds = build_dataset(self.cfg, "train")
         sampler = None
         if self.distributed:
@@ -406,9 +398,8 @@ class Trainer:
     def _ema_swapped(self, use_ema: bool):
         """Temporarily load EMA params into the live model, then restore.
 
-        Param swaps run under ``no_grad`` so this is safe even when the caller
-        keeps autograd enabled (e.g. meta K-shot eval, whose inner loop needs
-        grad): in-place copy_ on a leaf that requires grad would otherwise raise.
+        Param swaps run under ``no_grad`` so the in-place copy_ on leaves that
+        require grad is always safe, regardless of the caller's autograd state.
         """
         if use_ema and self.ema_params is not None:
             with torch.no_grad():

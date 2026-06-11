@@ -41,11 +41,7 @@ def main() -> None:
         cfg.training.init_from_ckpt = args.init_ckpt
     trainer = Trainer(cfg)
     try:
-        if bool(cfg.meta.enabled):
-            from .meta_train import meta_train
-            meta_train(trainer)
-        else:
-            trainer.train()
+        trainer.train()
     finally:
         trainer.close()
 

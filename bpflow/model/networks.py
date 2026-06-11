@@ -45,7 +45,6 @@ class BPConditions:
     ppg_seq: torch.Tensor  # (B, N, hidden)
     pooled: torch.Tensor  # (B, hidden)
     demo_emb: Optional[torch.Tensor] = None  # (B, hidden) global demo prior, or None
-    context_emb: Optional[torch.Tensor] = None  # (B, hidden) per-subject ANIL context, or None
 
 
 class DemoEncoder(nn.Module):
@@ -65,48 +64,6 @@ class DemoEncoder(nn.Module):
     def forward(self, cont: torch.Tensor, gender: torch.Tensor) -> torch.Tensor:
         h = self.cont_proj(cont) + self.gender_emb(gender)  # (B, hidden)
         return self.mlp(h)
-
-
-class ContextEncoder(nn.Module):
-    """Map a low-dim per-subject ANIL/CAVIA context vector into a global add-on.
-
-    The context ``phi`` (context_dim,) or (B, context_dim) is the ONLY per-subject
-    parameter adapted in the meta inner loop (the body is frozen there); this MLP
-    that turns it into a global_c contribution is part of the meta-learned body.
-    Zero biases (default init) make emb(phi=0)=0 -> phi=0 is the unadapted
-    population default (a no-op add-on), while the weights stay nonzero so
-    d(emb)/d(phi) != 0 and the inner loop can actually move phi (see
-    initialize_weights for why this must NOT be zero-init'd).
-    """
-
-    def __init__(self, context_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(context_dim, hidden_dim)
-        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
-
-    def forward(self, phi: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.proj(phi))  # (..., hidden)
-
-
-class BPHead(nn.Module):
-    """Predict [SBP_z, DBP_z] from pooled ECG/PPG features + the per-subject context.
-
-    The cheap, fully-differentiable scalar predictor the meta inner loop minimizes
-    against the support's cuff readings, so phi is calibrated from SBP/DBP scalars
-    alone -- no support ABP waveform needed (matches a real cuff). Sharing phi with
-    the generative path is what ties "phi that fits the scalars" to "phi that makes
-    the flow model generate ABP at that BP level".
-    """
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(), nn.Linear(hidden_dim, 2),
-        )
-
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.net(feat)  # (B, 2) = [SBP_z, DBP_z]
 
 
 def _patch_embedder(in_dim: int, hidden: int, mlp_kernel: int) -> nn.Sequential:
@@ -137,8 +94,6 @@ class BPFlowModel(nn.Module):
         joint_depth: int,
         mlp_ratio: float = 4.0,
         use_demo: bool = False,
-        use_context: bool = False,
-        context_dim: int = 64,
     ) -> None:
         super().__init__()
         if seq_len % patch_size != 0:
@@ -184,13 +139,6 @@ class BPFlowModel(nn.Module):
         self.use_demo = use_demo
         if use_demo:
             self.demo_encoder = DemoEncoder(hidden_dim)
-        # optional ANIL/CAVIA per-subject context encoder (zero-init -> no-op start)
-        self.use_context = use_context
-        self.context_dim = context_dim
-        if use_context:
-            self.context_encoder = ContextEncoder(context_dim, hidden_dim)
-            # cheap differentiable SBP/DBP predictor for scalar (cuff) inner-loop adaptation
-            self.bp_head = BPHead(hidden_dim)
 
         self.initialize_weights()
         latent_rot = compute_rope_rotations(self.latent_seq_len, head_dim, 10000, device="cpu")
@@ -225,11 +173,6 @@ class BPFlowModel(nn.Module):
             # zero-init the encoder output so demographics start as a no-op
             nn.init.constant_(self.demo_encoder.mlp[-1].weight, 0)
             nn.init.constant_(self.demo_encoder.mlp[-1].bias, 0)
-        # NOTE: the context encoder is deliberately NOT zero-init'd. Zero biases
-        # (from _basic_init) already make emb(phi=0)=0 (proj(0)=0, SiLU(0)=0), so
-        # phi=0 is the unadapted population default / no-op. But the WEIGHTS must
-        # stay nonzero, else d(emb)/d(phi)==0 and the inner loop can never move phi
-        # (a dead branch). Nonzero weights give d(emb)/d(phi)|_0 = W_last·0.5·W_proj.
 
     def _embed_cond(self, ecg_p: torch.Tensor, ppg_p: torch.Tensor) -> BPConditions:
         ecg_seq = self.ecg_input_proj(ecg_p)  # (B, N, H)
@@ -244,31 +187,15 @@ class BPFlowModel(nn.Module):
         cont, gender = demo
         return self.demo_encoder(cont, gender)  # (B, hidden)
 
-    def _context_emb(self, context: Optional[torch.Tensor], bs: int) -> Optional[torch.Tensor]:
-        """Encode the per-subject ANIL context ``phi`` into a (B, hidden) add-on.
-
-        ``context`` is (context_dim,) — one vector shared by the whole batch (one
-        subject per episode) — or (B, context_dim). Returns None when context
-        conditioning is off. Differentiable in ``phi`` so the inner loop can
-        adapt it; the expand keeps grads flowing to the single shared vector.
-        """
-        if not self.use_context or context is None:
-            return None
-        if context.dim() == 1:
-            context = context.unsqueeze(0).expand(bs, -1)  # (B, context_dim)
-        return self.context_encoder(context)  # (B, hidden)
-
     def preprocess_conditions(
         self,
         cond_patches: torch.Tensor,
         demo: Optional[DemoInput] = None,
-        context: Optional[torch.Tensor] = None,
     ) -> BPConditions:
         # cond_patches (B,N,2P) is channel-major [ECG(P), PPG(P)] -> split back.
         p = self.patch_size
         conds = self._embed_cond(cond_patches[..., :p], cond_patches[..., p:])
         conds.demo_emb = self._demo_emb(demo)
-        conds.context_emb = self._context_emb(context, cond_patches.shape[0])
         return conds
 
     def predict_flow(
@@ -278,8 +205,6 @@ class BPFlowModel(nn.Module):
         global_c = self.t_embed(t).unsqueeze(1) + conditions.pooled.unsqueeze(1)  # (B,1,H)
         if conditions.demo_emb is not None:
             global_c = global_c + conditions.demo_emb.unsqueeze(1)
-        if conditions.context_emb is not None:
-            global_c = global_c + conditions.context_emb.unsqueeze(1)
         ecg, ppg = conditions.ecg_seq, conditions.ppg_seq
         for block in self.joint_blocks:
             latent, ecg, ppg = block(latent, ecg, ppg, global_c, self.latent_rot)
@@ -293,24 +218,10 @@ class BPFlowModel(nn.Module):
         cond_patches: torch.Tensor,
         t: torch.Tensor,
         demo: Optional[DemoInput] = None,
-        context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.predict_flow(
-            latent_patches, t, self.preprocess_conditions(cond_patches, demo, context)
+            latent_patches, t, self.preprocess_conditions(cond_patches, demo)
         )
-
-    def predict_bp(self, cond_patches: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
-        """Predict (B,2)=[SBP_z, DBP_z] from ECG/PPG + the context phi.
-
-        Cheap (no ODE) and differentiable in phi, so the scalar meta inner loop can
-        calibrate phi against the support's cuff SBP/DBP. Reuses the same pooled
-        ECG/PPG features + context_emb the generative path conditions on.
-        """
-        conds = self.preprocess_conditions(cond_patches, None, context)
-        feat = conds.pooled
-        if conds.context_emb is not None:
-            feat = feat + conds.context_emb
-        return self.bp_head(feat)
 
     def ode_wrapper(
         self,

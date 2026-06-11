@@ -37,14 +37,6 @@ bash infer.sh output/<timestamp>/checkpoint_best.pth                 # all GPUs
 bash infer.sh output/<timestamp>/checkpoint_best.pth --nproc 4       # 4 GPUs
 python -m bpflow.infer --config bpflow/config/gpu.yaml --ckpt <path> --split test --num -1 --use-ema
 
-# ANIL/CAVIA meta-pretraining (sample-efficient per-subject adaptation). meta.yaml
-# turns on the per-subject context + episodic meta loop; train.sh routes to it.
-bash train.sh --nproc 8 --config bpflow/config/meta.yaml
-python -m bpflow.train --config bpflow/config/meta.yaml
-# Standalone subject-disjoint K-shot eval of a meta checkpoint (K=0,1,3,5,10 curve).
-python -m bpflow.meta_smoke                                          # CPU mechanic smoke
-python -m bpflow.kshot_eval --config bpflow/config/meta.yaml --ckpt <best> --use-ema --ks 0,1,3,5,10
-
 # Pull SwanLab metrics for the latest run (skill: swanlab-fetch)
 python ~/.claude/skills/swanlab-fetch/scripts/fetch_swanlab.py --latest
 
@@ -82,7 +74,6 @@ OmegaConf structured config with a `_base_:` include chain (resolved in `trainer
 - **`base.yaml`** — architecture, on-disk shapes, normalization constants (ABP + demographics), prediction_type. Anything here affects **checkpoint compatibility** (`infer.py` asserts `abp_mean`/`abp_std` match the checkpoint). Defaults to `split_mode: segment`, `use_demo: false`.
 - **`gpu.yaml`** (inherits `base.yaml`) — real **pretraining** (epochs 200, per-GPU batch 128, lr 3e-4, plateau lr-decay + early stop, SwanLab cloud). Uses `split_mode: segment` (random per-segment train/val), `use_demo: false` (pure ECG/PPG → ABP this round). Also `val_max_batches: -1` (full DDP-sharded val) and **`run_test_after_train: false`** — pretraining never touches CalFree (reserved for finetune).
 - **`finetune.yaml`** (inherits `gpu.yaml`) — domain adaptation on CalFree. Spells out its own `training` block (tune finetune hyperparams independently). **`data.finetune: true`** splits the CalFree `test_npy` 8:1:1 (per-segment, fixed seed) into train/val/test, and **`run_test_after_train: true`** evaluates the held-out 10% test split at the end. Weights init from a pretrained checkpoint via `--init-ckpt` (→ `training.init_from_ckpt`); optimizer/epoch/step reset.
-- **`meta.yaml`** (inherits `gpu.yaml`) — **ANIL/CAVIA meta-pretraining** for sample-efficient per-subject adaptation. Flips on `model.use_context: true` + `meta.enabled: true`; `train()` then runs the episodic meta loop (`meta_train.py`) instead of the epoch loop. Validation/test are **subject-disjoint K-shot** curves (meta-train on Train_Subset subjects, honest test on CalFree subjects).
 - **`smoke.yaml`** (inherits `base.yaml`) — tiny CPU model for the smoke test (not a real model). Inherits segment split + no demo, so the smoke test runs from the `.npy` alone (no CSV).
 
 ## Conventions and gotchas
@@ -101,11 +92,6 @@ OmegaConf structured config with a `_base_:` include chain (resolved in `trainer
 - **Demographics (`model.use_demo`) are a global prior.** Continuous `[age, height, weight, bmi, body_missing]` z-scored with the fixed `demo_*` config constants + a gender `nn.Embedding`, encoded by `DemoEncoder` and added to `global_c`. height/weight/bmi are ~48% jointly missing → `body_missing` flag set, NaN→0 (post-z-score mean). The `DemoEncoder` last layer is zero-init so enabling demo starts as a no-op.
 - **`run_test_after_train`** (gpu.yaml **false**, finetune.yaml **true**): after training finishes (normal end or early stop — NOT a `max_steps` interrupt), `Trainer.run_test()` evaluates the **best-by-val EMA** model on the `test` split (DDP-sharded, shared `_distributed_eval`), logs `test/*` to SwanLab, and writes `output/<ts>/test_metrics.json`. It runs inside `train()` before `close()`, so it lands in the same SwanLab run. `test_max_segments > 0` caps it. For finetune the `test` split is the held-out 10% of CalFree; pretraining leaves it off so CalFree is untouched.
 - **Finetune flow (`data.finetune: true`)** repurposes the CalFree `test_npy`: a fixed-seed **per-segment** 8:1:1 split (`finetune_val_fraction`/`finetune_test_fraction`, default 0.1/0.1) makes train/val/**test** all read CalFree, non-overlapping. `split_mode` is ignored (no subject split). The pretrained model is loaded via **`--init-ckpt`** → `training.init_from_ckpt` (`Trainer._maybe_init_from_ckpt`): it copies `model` (+ `model_ema`) weights only, then trains fresh (optimizer/epoch/step reset). Skipped when resuming an interrupted run. ⚠️ The split is per-segment, so the same subject can appear in both finetune-train and the final test → that test number is optimistic, not subject-disjoint.
-- **ANIL/CAVIA meta-learning (`meta.enabled` + `model.use_context`)** — for sample-efficient per-subject adaptation. The per-subject **context vector `phi`** (`model.context_dim`) is the ONLY thing adapted in the inner loop (body frozen); it's injected as a `global_c` add-on via `ContextEncoder` (same point as demo). **First-order (FOMAML)**: the inner loop uses `torch.autograd.grad(create_graph=False)`; the outer query loss backprops into body + `context_encoder` (+ `bp_head`).
-  - **Inner objective (`meta.inner_objective`, default `scalar`)**: `scalar` = **cuff-only, the realistic deployment** — adapt `phi` by matching the support's cuff `[SBP, DBP]` through the cheap differentiable `BPHead` (`model.predict_bp`); the support carries ECG/PPG + scalars, **NO ABP waveform** (`meta.adapt_context_scalar`). The outer loss adds `meta.bp_loss_weight · MSE(BPHead(query), query SBP/DBP)` so `BPHead` stays accurate and `phi`'s meaning stays tied to the generative level. `waveform` = adapt `phi` by the flow-matching loss on support ABP (needs the support waveform). Cuff SBP/DBP are z-scored by the fixed `data.bp_*` constants.
-  - `phi=0` is the population default (a no-op add-on); `ContextEncoder`/`BPHead` are deliberately **NOT zero-init** (zero biases give emb(0)=0; nonzero weights keep `∂emb/∂phi ≠ 0` so the inner loop can move phi — zero-init makes a dead branch).
-  - `Trainer._build_data` short-circuits in meta mode; `meta_train.py` builds per-subject episodes (`meta_data.EpisodeDataset`, 6-tuple carrying bp) and reuses the Trainer's model/EMA/optimizer/checkpoint/SwanLab. The meta loop runs on the **raw model with a manual grad all-reduce** (`_make_grad_reducer`), not DDP's wrapper (bp_head is used outside the generative forward).
-  - Eval is **subject-disjoint K-shot** (`meta.kshot_evaluate`, nested K with a fixed query, K=0 = calibration-free): val on Train_Subset held-out subjects, honest test on CalFree subjects. ⚠️ The multi-GPU meta loop is **not yet tested on real DDP** (eval runs rank-0-only behind a barrier).
 
 ## Git
 
