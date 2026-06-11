@@ -85,6 +85,14 @@ class Trainer:
 
     # -- setup -------------------------------------------------------------
     def _build_data(self) -> None:
+        # Meta-training builds its own per-subject episode loader (meta_data); the
+        # standard segment loader + val loader are unused, so skip them entirely.
+        if bool(self.cfg.meta.enabled):
+            self.train_ds = None
+            self.loader = None
+            self.sampler = None
+            self.val_loader = None
+            return
         self.train_ds = build_dataset(self.cfg, "train")
         sampler = None
         if self.distributed:
@@ -409,16 +417,23 @@ class Trainer:
 
     @contextlib.contextmanager
     def _ema_swapped(self, use_ema: bool):
-        """Temporarily load EMA params into the live model, then restore."""
+        """Temporarily load EMA params into the live model, then restore.
+
+        Param swaps run under ``no_grad`` so this is safe even when the caller
+        keeps autograd enabled (e.g. meta K-shot eval, whose inner loop needs
+        grad): in-place copy_ on a leaf that requires grad would otherwise raise.
+        """
         if use_ema and self.ema_params is not None:
-            backup = [p.detach().clone() for p in self.model_raw.parameters()]
-            for p, e in zip(self.model_raw.parameters(), self.ema_params):
-                p.copy_(e)
+            with torch.no_grad():
+                backup = [p.detach().clone() for p in self.model_raw.parameters()]
+                for p, e in zip(self.model_raw.parameters(), self.ema_params):
+                    p.copy_(e)
             try:
                 yield
             finally:
-                for p, b in zip(self.model_raw.parameters(), backup):
-                    p.copy_(b)
+                with torch.no_grad():
+                    for p, b in zip(self.model_raw.parameters(), backup):
+                        p.copy_(b)
         else:
             yield
 

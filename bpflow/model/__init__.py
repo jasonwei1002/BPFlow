@@ -35,6 +35,8 @@ def _build_jointstream(cfg) -> nn.Module:
         joint_depth=int(cfg.model.joint_depth),
         mlp_ratio=float(cfg.model.mlp_ratio),
         use_demo=bool(cfg.model.use_demo),
+        use_context=bool(cfg.model.use_context),
+        context_dim=int(cfg.model.context_dim),
     )
 
 
