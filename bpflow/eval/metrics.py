@@ -3,7 +3,7 @@
 Metrics follow the BP literature convention (see plan/notes.md):
 - waveform: MAE, RMSE (mmHg), per-segment Pearson r;
 - derived BP values: SBP/DBP = mean of the per-beat systolic peaks / diastolic
-  troughs, MAP = segment time-average;
+  troughs, MAP = (SBP + 2*DBP)/3 (clinical formula, PulseDB cuff convention);
 - AAMI: mean error (ME) and std of error (SDE); pass = |ME|<=5 and SDE<=8 mmHg;
 - BHS: cumulative % of |error| within 5/10/15 mmHg -> grade A/B/C.
 
@@ -61,11 +61,12 @@ def _perbeat_sbp_dbp(wave: torch.Tensor) -> Dict[str, torch.Tensor]:
 def segment_bp(wave: torch.Tensor) -> Dict[str, torch.Tensor]:
     """Per-segment SBP/DBP/MAP from a waveform. wave: (B, L) mmHg.
 
-    SBP/DBP = mean per-beat peak/trough; MAP = segment time-average (the DC level,
-    an independent fidelity check). Applied identically to the PRED and TRUE waves.
+    SBP/DBP = mean per-beat peak/trough; MAP = (SBP + 2*DBP)/3 (the clinical
+    formula, matching the PulseDB cuff convention). Applied identically to the
+    PRED and TRUE waves, so a perfect reconstruction scores 0.
     """
     bp = _perbeat_sbp_dbp(wave)
-    bp["MAP"] = wave.mean(dim=1)
+    bp["MAP"] = (bp["SBP"] + 2.0 * bp["DBP"]) / 3.0
     return bp
 
 
