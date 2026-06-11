@@ -3,6 +3,7 @@
 paper reference/
 wavflow/
 plan/
+/temp/
 # ===== Training outputs / checkpoints =====
 output/
 outputs/
@@ -16,6 +17,7 @@ checkpoints/
 *.pt
 *.ckpt
 *.safetensors
+
 
 # ===== Large data / array formats (in case any land outside data/) =====
 *.npy
