@@ -38,6 +38,7 @@ training:
   swanlab_project: bpflow
   swanlab_mode: cloud        # cloud | local | offline | disabled
   # --- finetune-specific ---
-  run_test_after_train: true # after finetune, eval the held-out 10% test split + log test/*
-  test_max_segments: -1      # all test-split segments (DDP-sharded)
+  run_test_after_train: false # training produces weights only; test the held-out 10%
+                              # separately with: bash infer.sh <ckpt> (uses finetune.yaml)
+  test_max_segments: -1      # all test-split segments (DDP-sharded; used if test is re-enabled)
   # init_from_ckpt is supplied at launch via finetune.sh / --init-ckpt

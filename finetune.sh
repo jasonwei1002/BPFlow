@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Finetune a pretrained BPFlow model on the CalFree domain (single-node, multi-GPU
 # via torchrun). CalFree is split 8:1:1 (per-segment) into train/val/test; this
-# finetunes on the 80% train and, when done, evaluates on the held-out 10% test.
+# finetunes on the 80% train (val for early stop) and produces weights only -- it
+# does NOT auto-test. Evaluate the held-out 10% separately: bash infer.sh <ckpt>.
 # Runs live under a NEW output/<timestamp>/.
 # Args: <pretrained_checkpoint> [--nproc <gpu|N>] [extra args...]   (--nproc default 'gpu')
 #   all visible GPUs (default):  bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth
