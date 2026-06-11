@@ -31,10 +31,6 @@ class ModelConfig:
     mlp_ratio: float = 4.0
     joint_depth: int = 8  # number of 3-stream (ABP+ECG+PPG) joint-attention layers
     use_demo: bool = False  # condition on demographics (age/gender/height/weight/bmi)
-    # ANIL/CAVIA per-subject context: a low-dim vector adapted in the meta inner
-    # loop (body frozen) and injected as a global_c add-on. Zero-init -> no-op start.
-    use_context: bool = False
-    context_dim: int = 64
 
 
 @dataclass
@@ -54,6 +50,11 @@ class DataConfig:
     abp_clip_low: float = 20.0
     abp_clip_high: float = 250.0
     cond_recenter: bool = True
+    # Clinical-metric TRUE source for infer.py. "waveform" = derive SBP/DBP/MAP
+    # per-beat from the true ABP wave (no CSV, no definitional offset); "csv" =
+    # the CSV cuff [sbp, dbp, map] label; "both" = report both side by side. PRED
+    # is always per-beat from the generated wave. (Trainer val/test stay waveform.)
+    eval_true_source: str = "waveform"
     # Train/val split. "segment" = random per-segment (leaks subjects across
     # train/val → optimistic val); "subject" = subject-disjoint via CSV
     # subject_id (honest val, matches the CalFree test setting).
@@ -69,13 +70,6 @@ class DataConfig:
     demo_weight_std: float = 11.66
     demo_bmi_mean: float = 22.92
     demo_bmi_std: float = 3.44
-    # Cuff SBP/DBP z-score constants (full train CSV) for the scalar-supervised
-    # meta inner loop (model.use_context). These are the CALIBRATION cuff readings
-    # carried by the support set; never the query's own SBP/DBP (the eval target).
-    bp_sbp_mean: float = 118.60
-    bp_sbp_std: float = 21.03
-    bp_dbp_mean: float = 61.86
-    bp_dbp_std: float = 12.65
     # Finetune mode: ignore train_npy/split_mode and instead split the CalFree
     # `test_npy` into train/val/test by a fixed-seed per-segment partition
     # (8:1:1 by default). Used by the finetune flow to adapt a pretrained model
@@ -139,41 +133,11 @@ class TrainingConfig:
 
 
 @dataclass
-class MetaConfig:
-    # ANIL/CAVIA meta-training (needs model.use_context: true). When enabled,
-    # train() runs the episodic meta loop instead of the standard epoch loop;
-    # validation/test become subject-disjoint K-shot adaptation (honest few-shot).
-    enabled: bool = False
-    # Inner-loop adaptation target:
-    #   "scalar"   — cuff-only: adapt phi by matching the support's SBP/DBP via a
-    #                BPHead (support carries ECG/PPG + cuff scalars, NO ABP).
-    #   "waveform" — reference-ABP: adapt phi by the flow-matching loss on support
-    #                ABP (needs the support's ABP waveform).
-    inner_objective: str = "scalar"
-    bp_loss_weight: float = 0.1  # outer-loss weight on the query SBP/DBP head term
-    k_inner: int = 5            # inner adaptation steps on the support set
-    inner_lr: float = 0.05      # inner-loop SGD step on the context phi
-    support_size: int = 5       # Ks: support segments per training episode
-    query_size: int = 5         # Kq: query segments per training episode
-    meta_batch_subjects: int = 8  # subjects per outer meta-step (per rank)
-    meta_steps: int = 20000     # total outer meta-steps
-    log_every: int = 50
-    ckpt_every: int = 1000
-    val_every: int = 1000       # outer steps between K-shot validations
-    val_subject_fraction: float = 0.1  # subject-disjoint val split of train subjects
-    eval_ks: str = "0,1,3,5,10"        # K-shot points reported at eval
-    eval_max_subjects: int = 200       # cap subjects per K-shot eval (per rank shard)
-    eval_max_query: int = 40           # cap query segments per subject in eval
-    num_workers: int = 4
-
-
-@dataclass
 class BPFlowConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    meta: MetaConfig = field(default_factory=MetaConfig)
 
 
 # ----------------------------------------------------------------------------
@@ -204,15 +168,17 @@ def load_config(config_path: Optional[str] = None, overrides: Optional[dict] = N
     return cfg  # type: ignore[return-value]
 
 
-def drop_legacy_keys(state: dict) -> dict:
-    """Drop removed-feature keys so pre-removal checkpoints still load.
+# Prefixes of state-dict keys for since-removed features. Pre-removal checkpoints
+# carry these as now-unexpected keys; their body weights are still valid, so we
+# strip them on load. Anything else stays, so a real mismatch still fails loudly.
+#   empty_*                      — classifier-free-guidance null conditions
+#   context_encoder.* / bp_head.* — ANIL/CAVIA per-subject context + cuff head
+_LEGACY_KEY_PREFIXES = ("empty_", "context_encoder.", "bp_head.")
 
-    The classifier-free-guidance null conditions (``empty_ecg``/``empty_ppg``) were
-    removed; an old checkpoint carries them as now-unexpected keys. They were a
-    no-op (zero contribution), so dropping them loses nothing. Everything else is
-    left untouched, so a genuinely incompatible checkpoint still fails loudly.
-    """
-    return {k: v for k, v in state.items() if not k.startswith("empty_")}
+
+def drop_legacy_keys(state: dict) -> dict:
+    """Drop removed-feature keys so pre-removal checkpoints still load."""
+    return {k: v for k, v in state.items() if not k.startswith(_LEGACY_KEY_PREFIXES)}
 
 
 # ----------------------------------------------------------------------------

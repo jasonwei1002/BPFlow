@@ -65,6 +65,10 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
 def run_inference(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     cfg = load_config(args.config)
+    # --true-source overrides the config so the dataset loads the CSV cuff label
+    # (bp_true) and the report uses the same source.
+    if args.true_source is not None:
+        cfg.data.eval_true_source = args.true_source
 
     # Distributed (single-node multi-GPU via torchrun). When WORLD_SIZE == 1 this
     # is identical to the old single-process path.
@@ -105,7 +109,7 @@ def run_inference(args: argparse.Namespace) -> None:
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed)
 
-    preds, gts = [], []
+    preds, gts, bps = [], [], []
     use_demo = bool(cfg.model.use_demo)
     desc = f"infer (rank0 shard of {total})" if distributed else f"infer ({total})"
     for batch in tqdm(loader, desc=desc, disable=not is_main):
@@ -117,29 +121,51 @@ def run_inference(args: argparse.Namespace) -> None:
         )
         preds.append(out.cpu())
         gts.append(batch["abp_raw"].cpu())
+        if "bp_true" in batch:  # CSV cuff [SBP, DBP, MAP] -> clinical TRUE
+            bps.append(batch["bp_true"].cpu())
 
     pred = torch.cat(preds, dim=0) if preds else None
     gt = torch.cat(gts, dim=0) if gts else None
+    bp = torch.cat(bps, dim=0) if bps else None
 
     if distributed:
         import torch.distributed as dist
 
         gathered: list = [None] * world_size
-        dist.all_gather_object(gathered, (pred, gt))
+        dist.all_gather_object(gathered, (pred, gt, bp))
         dist.barrier()
         dist.destroy_process_group()
         if not is_main:
             return
-        pred = torch.cat([p for p, _ in gathered if p is not None], dim=0)
-        gt = torch.cat([g for _, g in gathered if g is not None], dim=0)
+        pred = torch.cat([p for p, _, _ in gathered if p is not None], dim=0)
+        gt = torch.cat([g for _, g, _ in gathered if g is not None], dim=0)
+        bp_parts = [b for _, _, b in gathered if b is not None]
+        bp = torch.cat(bp_parts, dim=0) if bp_parts else None
 
-    report = evaluate(pred, gt)
-    logger.info("evaluated %d segments across %d process(es)", pred.shape[0], world_size)
+    # Clinical TRUE source(s): waveform (per-beat on the true wave), csv (cuff label),
+    # or both. PRED is always per-beat from the generated wave.
+    source = str(args.true_source or cfg.data.eval_true_source)
+    true_bp = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]} if bp is not None else None
+    if source in ("csv", "both") and true_bp is None:
+        raise RuntimeError(
+            f"eval_true_source='{source}' needs the CSV cuff label but no bp_true was "
+            "loaded (is the sibling CSV present and data.eval_true_source set?)."
+        )
+    reports: dict = {}
+    if source in ("waveform", "both"):
+        reports["true_waveform"] = evaluate(pred, gt)
+    if source in ("csv", "both"):
+        reports["true_csv"] = evaluate(pred, gt, true_bp)
+    logger.info("evaluated %d segments across %d process(es) [true=%s]",
+                pred.shape[0], world_size, source)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "metrics.json").write_text(json.dumps(report, indent=2))
-    logger.info("\n%s", format_report(report))
+    # single source -> flat report (back-compat); both -> {true_waveform, true_csv}
+    payload = next(iter(reports.values())) if len(reports) == 1 else reports
+    (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2))
+    for name, rep in reports.items():
+        logger.info("[%s]\n%s", name, format_report(rep))
     logger.info("metrics -> %s", out_dir / "metrics.json")
 
     if args.save_waveforms:
@@ -190,6 +216,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--use-ema", action="store_true")
+    ap.add_argument("--true-source", default=None, choices=["waveform", "csv", "both"],
+                    help="clinical TRUE source (default: data.eval_true_source). "
+                         "waveform=per-beat on true wave; csv=cuff label; both=report both")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=14159265)
     ap.add_argument("--out", default="output/infer")

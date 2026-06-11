@@ -27,6 +27,11 @@ data:
   abp_clip_low: 20.0
   abp_clip_high: 250.0
   cond_recenter: true
+  # clinical-metric TRUE source for infer.py (pred is always per-beat from the
+  # generated wave): waveform = per-beat on the true ABP wave (no CSV, no
+  # definitional offset) | csv = the CSV cuff [sbp,dbp,map] label | both = report
+  # both side by side. csv/both need the sibling CSV. Override per-run: infer --true-source.
+  eval_true_source: waveform
   # demographic z-score constants (full train split, non-NaN); used when model.use_demo
   demo_age_mean: 61.11
   demo_age_std: 15.10
