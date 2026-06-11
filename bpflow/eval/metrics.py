@@ -2,17 +2,31 @@
 
 Metrics follow the BP literature convention (see plan/notes.md):
 - waveform: MAE, RMSE (mmHg), per-segment Pearson r;
-- derived BP values: SBP = segment max, DBP = segment min, MAP = segment mean;
+- derived BP values: SBP/DBP = mean of the per-beat systolic peaks / diastolic
+  troughs, MAP = segment time-average;
 - AAMI: mean error (ME) and std of error (SDE); pass = |ME|<=5 and SDE<=8 mmHg;
 - BHS: cumulative % of |error| within 5/10/15 mmHg -> grade A/B/C.
 
 These are the GATE for ABP reconstruction quality (more honest than sample
 MSE, which hides DC-offset / systematic SBP-DBP bias).
+
+Why per-beat (not amax/amin): a 10 s segment holds ~10 beats; amax/amin pick the
+single global extreme across them, which is biased high/low by the beat-to-beat
+spread and sensitive to a lone spurious peak in the generated waveform. The mean
+of the per-beat peaks/troughs is the robust per-segment SBP/DBP. BOTH the
+generated (PRED) and the true waveform go through the same extractor, so the
+SBP/DBP comparison carries no definitional bias (a perfect reconstruction scores 0).
 """
 
 from typing import Dict
 
 import torch
+
+# Per-beat detection (PulseDB segments are 10 s @ 125 Hz = 1250 samples).
+_FS = 125.0
+_MIN_BEAT_DIST = int(0.4 * _FS)  # >=0.4 s between beats (HR <= 150 bpm)
+_PROM_FRAC = 0.1                 # peak prominence as a fraction of the segment range
+_PROM_FLOOR = 3.0                # mmHg, so a near-flat early-training wave still detects
 
 
 def _pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
@@ -24,13 +38,35 @@ def _pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
     return num / den
 
 
+def _perbeat_sbp_dbp(wave: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Mean per-beat systolic peak / diastolic trough. wave: (B, L) mmHg -> (B,).
+
+    Loops per segment with scipy.find_peaks (distance + prominence reject the
+    dicrotic notch / noise). Degenerate (no peaks found) falls back to amax/amin.
+    """
+    from scipy.signal import find_peaks
+
+    w = wave.detach().to("cpu", torch.float32).numpy()
+    sbp = torch.empty(w.shape[0], dtype=torch.float32)
+    dbp = torch.empty(w.shape[0], dtype=torch.float32)
+    for i, seg in enumerate(w):
+        prom = max(_PROM_FLOOR, _PROM_FRAC * float(seg.max() - seg.min()))
+        pk, _ = find_peaks(seg, distance=_MIN_BEAT_DIST, prominence=prom)
+        tr, _ = find_peaks(-seg, distance=_MIN_BEAT_DIST, prominence=prom)
+        sbp[i] = float(seg[pk].mean()) if pk.size else float(seg.max())
+        dbp[i] = float(seg[tr].mean()) if tr.size else float(seg.min())
+    return {"SBP": sbp, "DBP": dbp}
+
+
 def segment_bp(wave: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """Per-segment SBP/DBP/MAP. wave: (B, L) mmHg."""
-    return {
-        "SBP": wave.amax(dim=1),
-        "DBP": wave.amin(dim=1),
-        "MAP": wave.mean(dim=1),
-    }
+    """Per-segment SBP/DBP/MAP from a waveform. wave: (B, L) mmHg.
+
+    SBP/DBP = mean per-beat peak/trough; MAP = segment time-average (the DC level,
+    an independent fidelity check). Applied identically to the PRED and TRUE waves.
+    """
+    bp = _perbeat_sbp_dbp(wave)
+    bp["MAP"] = wave.mean(dim=1)
+    return bp
 
 
 def waveform_metrics(pred: torch.Tensor, true: torch.Tensor) -> Dict[str, float]:
@@ -67,7 +103,12 @@ def bhs(pred_vals: torch.Tensor, true_vals: torch.Tensor) -> Dict[str, object]:
 
 
 def evaluate(pred_mmhg: torch.Tensor, true_mmhg: torch.Tensor) -> Dict[str, dict]:
-    """Full report. pred/true: (B, L) mmHg."""
+    """Full report. pred/true waveforms: (B, L) mmHg.
+
+    SBP/DBP/MAP are derived per-beat from BOTH the generated and the true waveform
+    (the same ``segment_bp`` extractor), so the clinical comparison reflects pure
+    waveform fidelity with no definitional offset.
+    """
     report: Dict[str, dict] = {"waveform": waveform_metrics(pred_mmhg, true_mmhg)}
     pred_bp = segment_bp(pred_mmhg)
     true_bp = segment_bp(true_mmhg)
