@@ -469,7 +469,8 @@ class Trainer:
                 self.best_val = val_mae
                 self.epochs_no_improve = 0
                 self.save_checkpoint(done_epochs, "checkpoint_best.pth")
-                logger.info("New best val MAE %.4f mmHg @ epoch %d -> checkpoint_best.pth", val_mae, done_epochs)
+                best_path = os.path.abspath(os.path.join(self.exp_dir, "checkpoint_best.pth"))
+                logger.info("New best val MAE %.4f mmHg @ epoch %d -> %s", val_mae, done_epochs, best_path)
             else:
                 self.epochs_no_improve += 1
                 logger.info("val MAE %.4f: no improvement for %d val round(s) (best %.4f)",
