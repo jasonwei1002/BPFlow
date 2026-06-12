@@ -251,14 +251,23 @@ class Trainer:
 
     @staticmethod
     def _flat_report(report: dict, prefix: str = "val") -> dict:
-        """Flatten the eval report into scalar metrics for logging (val/ or test/)."""
+        """Flatten the eval report into scalar metrics for logging (val/ or test/).
+
+        Top-level SBP/DBP/MAP → ``{prefix}/{key}_*`` (waveform-truth). A ``cuff``
+        block, when present (post-train test with the CSV label), → a parallel
+        ``{prefix}/cuff_{key}_*`` so both truth sources are logged separately.
+        """
         out = {f"{prefix}/{k}": float(v) for k, v in report["waveform"].items()}
-        for key in ("SBP", "DBP", "MAP"):
-            a, b = report[key]["AAMI"], report[key]["BHS"]
-            out[f"{prefix}/{key}_ME"] = float(a["ME"])
-            out[f"{prefix}/{key}_SDE"] = float(a["SDE"])
-            out[f"{prefix}/{key}_AAMI_pass"] = float(a["pass"])
-            out[f"{prefix}/{key}_within5mmHg"] = float(b["<=5mmHg"])
+        sources = [("", report)]
+        if "cuff" in report:
+            sources.append(("cuff_", report["cuff"]))
+        for infix, rep in sources:
+            for key in ("SBP", "DBP", "MAP"):
+                a, b = rep[key]["AAMI"], rep[key]["BHS"]
+                out[f"{prefix}/{infix}{key}_ME"] = float(a["ME"])
+                out[f"{prefix}/{infix}{key}_SDE"] = float(a["SDE"])
+                out[f"{prefix}/{infix}{key}_AAMI_pass"] = float(a["pass"])
+                out[f"{prefix}/{infix}{key}_within5mmHg"] = float(b["<=5mmHg"])
         return out
 
     def _autocast(self):
@@ -435,22 +444,26 @@ class Trainer:
                         self.save_checkpoint(done, "checkpoint_latest.pth")
                         logger.info("Early stopped at epoch %d (best val MAE %.4f).", done, self.best_val)
                     self._barrier()
-                    self._maybe_run_test()
+                    self._maybe_run_test(done)
                     return
             if is_main_process() and ckpt_freq > 0 and done % ckpt_freq == 0:
                 self.save_checkpoint(done, "checkpoint_latest.pth")
             self._barrier()
-        if val_freq > 0:
+        # Final validation — only if the last epoch wasn't already validated in-loop
+        # (n_epochs % val_freq == 0), else it validates twice at the same epoch →
+        # spurious epochs_no_improve increment + a duplicate val/* log at step=n_epochs.
+        if val_freq > 0 and n_epochs % val_freq != 0:
             self._run_validation(n_epochs)
         if is_main_process():
             logger.info("Training done in %.1fs", time.time() - start)
             self.save_checkpoint(n_epochs, "checkpoint_latest.pth")
-        self._maybe_run_test()
+        self._maybe_run_test(n_epochs)
 
     def _run_validation(self, done_epochs: int) -> None:
         # validate() returns the real MAE on rank 0 and inf elsewhere, so all
-        # plateau/early-stop decisions are made on rank 0 then broadcast.
-        val_mae = self.validate()
+        # plateau/early-stop decisions are made on rank 0 then broadcast. val/*
+        # is logged to SwanLab with step=done_epochs (epoch x-axis).
+        val_mae = self.validate(done_epochs)
         if is_main_process():
             if val_mae < self.best_val:
                 self.best_val = val_mae
@@ -541,7 +554,11 @@ class Trainer:
         """
         was_training = self.model_raw.training
         self.model_raw.eval()
-        keys = ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t", "ae", "se", "r")
+        # `*_t` = waveform-truth BP (per-beat on the true wave); `*_c` = CSV cuff
+        # label, gathered only when the dataset loaded bp_true (eval_true_source
+        # csv/both) → enables a second, parallel clinical truth source.
+        keys = ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t", "ae", "se", "r",
+                "sbp_c", "dbp_c", "map_c")
         cols: dict = {k: [] for k in keys}
         for bi, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=not is_main_process())):
             if 0 < max_batches <= bi:
@@ -557,9 +574,14 @@ class Trainer:
             cols["ae"].append(err.abs().mean(dim=1))   # (b,) per-segment MAE
             cols["se"].append((err ** 2).mean(dim=1))  # (b,) per-segment MSE
             cols["r"].append(_pearson(pred, gt))        # (b,) per-segment Pearson
+            cuff = batch.get("bp_true")  # (b, 3) [SBP, DBP, MAP] cuff label, or None
+            if cuff is not None:
+                cols["sbp_c"].append(cuff[:, 0]); cols["dbp_c"].append(cuff[:, 1]); cols["map_c"].append(cuff[:, 2])
         if was_training:
             self.model_raw.train()
-        local = {k: torch.cat(v) for k, v in cols.items()} if cols["ae"] else None
+        # Drop empty cuff cols when no bp_true was present → gathered dict keys stay
+        # consistent across ranks (all ranks share the same config).
+        local = {k: torch.cat(v) for k, v in cols.items() if v} if cols["ae"] else None
 
         if self.distributed:
             import torch.distributed as dist
@@ -585,7 +607,10 @@ class Trainer:
 
         MAE/RMSE aggregate exactly because every segment has equal length L (so a
         mean-of-per-segment-means equals the global mean; same for MSE). Pearson is
-        the per-segment-r mean, matching ``waveform_metrics``.
+        the per-segment-r mean, matching ``waveform_metrics``. Top-level SBP/DBP/MAP
+        are the waveform-truth clinical metrics (PRED per-beat vs the true wave's
+        per-beat). When the CSV cuff label was gathered (``*_c`` present), a parallel
+        ``cuff`` block reports the same clinical metrics against the cuff label.
         """
         report = {"waveform": {
             "MAE": m["ae"].mean().item(),
@@ -596,6 +621,12 @@ class Trainer:
         true_bp = {"SBP": m["sbp_t"], "DBP": m["dbp_t"], "MAP": m["map_t"]}
         for key in ("SBP", "DBP", "MAP"):
             report[key] = {"AAMI": aami(pred_bp[key], true_bp[key]), "BHS": bhs(pred_bp[key], true_bp[key])}
+        if "sbp_c" in m:
+            cuff_bp = {"SBP": m["sbp_c"], "DBP": m["dbp_c"], "MAP": m["map_c"]}
+            report["cuff"] = {
+                key: {"AAMI": aami(pred_bp[key], cuff_bp[key]), "BHS": bhs(pred_bp[key], cuff_bp[key])}
+                for key in ("SBP", "DBP", "MAP")
+            }
         return report
 
     @torch.no_grad()
@@ -666,10 +697,13 @@ class Trainer:
         return {name: vals[i + 1] / n for i, name in enumerate(active)}
 
     @torch.no_grad()
-    def validate(self) -> float:
+    def validate(self, epoch: int) -> float:
         """DDP-sharded validation; mean waveform MAE (mmHg) on rank 0 (inf
         elsewhere). Uses the current in-memory EMA weights. Evaluates the whole
-        val_loader, which is already stride-subsampled to ``val_eval_fraction``."""
+        val_loader, which is already stride-subsampled to ``val_eval_fraction``.
+
+        ``val/*`` metrics are logged to SwanLab with ``step=epoch`` (an epoch
+        x-axis, not the global train step) since validation is once-per-epoch."""
         if self.val_loader is None:
             return float("inf")
         with self._ema_swapped(self.use_ema):
@@ -682,33 +716,48 @@ class Trainer:
         metrics = self._flat_report(report, "val")
         for k, v in mod_losses.items():
             metrics[f"val/loss_{k}"] = v
-        self._sw_log(metrics, self.global_step)
+        self._sw_log(metrics, epoch)
         if mod_losses:
             logger.info("[val] flow-matching loss  %s",
                         "  ".join(f"{k}={v:.4f}" for k, v in mod_losses.items()))
         return float(report["waveform"]["MAE"])
 
     # -- final test --------------------------------------------------------
-    def _maybe_run_test(self) -> None:
+    def _maybe_run_test(self, epoch: int) -> None:
         """After training, optionally evaluate on the CalFree test set.
 
         Gated by ``training.run_test_after_train``. Runs on ALL ranks (DDP-sharded
-        + gathered), logs ``test/*`` to SwanLab and writes ``test_metrics.json``.
-        Wrapped so a post-train eval failure never crashes an otherwise-finished run.
+        + gathered), logs ``test/*`` to SwanLab (at ``step=epoch``, the same epoch
+        axis as ``val/*``) and writes ``test_metrics.json``. Wrapped so a post-train
+        eval failure never crashes an otherwise-finished run.
         """
         if not bool(self.cfg.training.run_test_after_train):
             return
         self._barrier()  # ensure rank 0 has flushed checkpoint_best.pth to disk
         try:
-            self.run_test()
+            self.run_test(epoch)
         except Exception as e:
             if is_main_process():
                 logger.error("Post-train test evaluation failed: %s", e)
 
     @torch.no_grad()
-    def run_test(self) -> None:
-        """Evaluate the best-by-val (EMA) model on CalFree test; log + save metrics."""
-        test_ds = build_dataset(self.cfg, "test")
+    def run_test(self, epoch: int) -> None:
+        """Evaluate the best-by-val (EMA) model on CalFree test; log + save metrics.
+
+        Forces BOTH clinical truth sources: PRED per-beat is scored against the
+        true-wave per-beat (test/*) AND, when the sibling CSV is present, the CSV
+        cuff label (test/cuff_*) — logged separately. Falls back to waveform-truth
+        only if the CSV is genuinely absent.
+        """
+        # Override eval_true_source to "both" so the dataset loads the cuff label;
+        # _distributed_eval then auto-reports the parallel cuff clinical block.
+        cfg_test = OmegaConf.create(OmegaConf.to_container(self.cfg, resolve=True))
+        cfg_test.data.eval_true_source = "both"
+        try:
+            test_ds = build_dataset(cfg_test, "test")
+        except FileNotFoundError:
+            logger.warning("CSV cuff label not found; post-train test runs waveform-truth only")
+            test_ds = build_dataset(self.cfg, "test")
         total = len(test_ds)
         max_seg = int(self.cfg.training.test_max_segments)
         if 0 < max_seg < total:
@@ -726,8 +775,12 @@ class Trainer:
         report = self._distributed_eval(loader, f"test ({total})", -1)
         if report is None or not is_main_process():
             return
-        logger.info("[test] %d segments (weights=%s)\n%s", total, src, format_report(report))
-        self._sw_log(self._flat_report(report, "test"), self.global_step)
+        logger.info("[test] %d segments (weights=%s) — clinical vs true wave\n%s",
+                    total, src, format_report(report))
+        if "cuff" in report:
+            logger.info("[test] clinical vs CSV cuff\n%s",
+                        format_report({"waveform": report["waveform"], **report["cuff"]}))
+        self._sw_log(self._flat_report(report, "test"), epoch)  # epoch axis, like val/*
         path = os.path.join(self.exp_dir, "test_metrics.json")
         with open(path, "w") as f:
             json.dump(report, f, indent=2)

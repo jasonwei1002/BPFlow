@@ -128,6 +128,14 @@ class PulseDBDataset(Dataset):
             raise ValueError(f"finetune_train_ratio must be in (0, 1], got {finetune_train_ratio}")
         if finetune_split_mode not in ("segment", "stratified"):
             raise ValueError(f"finetune_split_mode must be segment/stratified, got {finetune_split_mode}")
+        # Root-guard both finetune split paths: val+test must leave room for train.
+        # (The stratified path slices per subject and would otherwise silently
+        # mis-assign with a negative n_train; the segment path raises on its own.)
+        if finetune and finetune_val_fraction + finetune_test_fraction >= 1.0:
+            raise ValueError(
+                "finetune val+test fractions must sum to < 1 (leave room for train), got "
+                f"val={finetune_val_fraction} + test={finetune_test_fraction}"
+            )
         self.arr = np.load(npy_path, mmap_mode="r")
         if self.arr.ndim != 3 or self.arr.shape[1] < 3:
             raise ValueError(f"expected (N,3,L) array at {npy_path}, got {self.arr.shape}")
