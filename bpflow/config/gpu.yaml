@@ -27,12 +27,15 @@ training:
   use_ema: true
   max_steps: -1
   val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
-  val_max_batches: -1        # full val split (DDP-sharded across GPUs; -1 = all)
+  val_eval_fraction: 0.1     # validate on a representative stride-sampled 10% of val
+                             # (covers all subjects; fixed across epochs) — enough to
+                             # track the MAE trend at ~10x cheaper validation
+  val_loss_max_batches: -1   # per-modality val flow-matching loss on the FULL val split (-1 = all)
   lr_patience: 5             # 5 epochs w/o val improvement -> lr x lr_decay
   lr_decay: 0.1              # "下降10倍"
   early_stop_patience: 10    # 10 epochs w/o val improvement -> stop
   use_swanlab: true
   swanlab_project: bpflow
-  swanlab_mode: cloud       # cloud | local | offline | disabled
+  swanlab_mode: online      # online | local | offline | disabled
   run_test_after_train: false # pretraining does NOT touch CalFree; test runs only in the finetune flow
   test_max_segments: -1      # cap test segments (-1 = all); used by the finetune test split

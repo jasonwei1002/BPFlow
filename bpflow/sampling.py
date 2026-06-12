@@ -46,17 +46,20 @@ def sample_abp(
     abp_std: float,
     autocast_ctx=None,
     demo=None,
+    cond_mask=None,
 ) -> torch.Tensor:
     """Sample ABP waveforms (mmHg, shape (B, L)) from ECG+PPG condition patches.
 
     Assumes ``model`` is the raw (unwrapped) model already in the desired
     eval/param state. ``demo`` is an optional (cont, gender) demographics sample
-    used as a global prior.
+    used as a global prior. ``cond_mask`` (B, 2) selects which modalities
+    condition the model (the rest are nulled); None = all present.
     """
     cond_patches = cond_patches.to(device)
     demo = _demo_to(demo, device)
+    cond_mask = cond_mask.to(device) if cond_mask is not None else None
     bs = cond_patches.shape[0]
-    conditions = model.preprocess_conditions(cond_patches, demo)
+    conditions = model.preprocess_conditions(cond_patches, demo, cond_mask)
     x0 = (
         torch.randn(
             bs, model.latent_seq_len, model.latent_dim, generator=generator, device=device
@@ -82,14 +85,21 @@ def flow_matching_loss(
     prediction_type: str,
     loss_type: str,
     demo=None,
+    cond_mask=None,
+    per_sample: bool = False,
 ) -> torch.Tensor:
-    """One flow-matching training step: noise -> predict -> loss (mean scalar).
+    """One flow-matching training step: noise -> predict -> loss.
 
     ``model`` is called for the forward, so pass the DDP-wrapped module when
     training under DDP (gradient sync) and the raw module otherwise. ``demo`` is
     an optional (cont, gender) demographics sample (already on the right device).
+    ``cond_mask`` (B, 2) selects the conditioning modalities (rest nulled).
+    Returns the mean scalar; with ``per_sample=True`` returns the per-sample
+    ``(B,)`` loss instead (``fm.loss`` already reduces over all but the batch
+    dim) — used to decompose the train loss by modality without an extra forward.
     """
     t = log_normal_sample(abp_patches, generator=generator, m=logit_mean, s=logit_scale)
     x0, x1, xt, t_sh = fm.get_x0_xt_c(abp_patches, t, generator=generator)
-    pred = model(xt, cond_patches, t_sh, demo)
-    return fm.loss(prediction_type, loss_type, pred, x0, xt, x1, t_sh).mean()
+    pred = model(xt, cond_patches, t_sh, demo, cond_mask)
+    per = fm.loss(prediction_type, loss_type, pred, x0, xt, x1, t_sh)  # (B,)
+    return per if per_sample else per.mean()

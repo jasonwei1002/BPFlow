@@ -1,12 +1,14 @@
 """BPFlow inference + evaluation.
 
 Loads a trained checkpoint, generates ABP waveforms from ECG+PPG for a chosen
-split (default: the subject-disjoint CalFree test set), denormalizes to mmHg,
-and reports waveform + clinical (AAMI/BHS) metrics.
+split, denormalizes to mmHg, and reports waveform + clinical (AAMI/BHS) metrics.
+The `test` split depends on the config: finetune.yaml (data.finetune true) -> the
+held-out 10% of CalFree the finetune never trained on; otherwise -> the full
+subject-disjoint CalFree test set.
 
-Run:
-    python -m bpflow.infer --config bpflow/config/gpu.yaml \
-        --ckpt output/bpflow_gpu_p10/checkpoint_latest.pth --split test --num 2000
+Run (evaluate a finetuned checkpoint on the CalFree held-out test split):
+    python -m bpflow.infer --config bpflow/config/finetune.yaml \
+        --ckpt output/<finetune_ts>/checkpoint_best.pth --split test --num -1 --use-ema
 """
 
 import argparse
@@ -19,11 +21,11 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from .data import build_dataset
+from .data import build_dataset, trained_modalities
 from .eval import evaluate, format_report
 from .model import build_model
 from .sampling import build_flow_matching, sample_abp
-from .trainer_utils import drop_legacy_keys, load_config, pick_device, set_seed
+from .trainer_utils import load_config, load_model_state, pick_device, set_seed
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,27 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
                     f"{key} mismatch: ckpt={ckpt[key]} cfg={getattr(cfg.data, key)}. "
                     "Use the config the checkpoint was trained with."
                 )
+        # Only infer with a modality the checkpoint actually TRAINED on — else the
+        # absent stream's null token is in an unseen state and the output is junk.
+        # The trained set is:
+        #   - modality_dropout: every modality with prob > 0 (the unified case;
+        #     degenerate probs like [1,0,0] correctly collapse to one direction).
+        #   - specialist (no dropout): just the fixed cond_modality.
+        #   - old checkpoints predate both fields → {ecg_ppg}.
+        ck_cfg = ckpt.get("config")
+        ck_data = ck_cfg.get("data", {}) if isinstance(ck_cfg, dict) else {}
+        ck_modality = str(ck_data.get("cond_modality", "ecg_ppg"))
+        ck_dropout = bool(ck_data.get("modality_dropout", False))
+        cfg_modality = str(getattr(cfg.data, "cond_modality", "ecg_ppg"))
+        trained = trained_modalities(
+            ck_modality, ck_dropout, ck_data.get("modality_dropout_probs")
+        )
+        if cfg_modality not in trained:
+            raise ValueError(
+                f"cond_modality {cfg_modality!r} not in the checkpoint's trained "
+                f"modalities {sorted(trained)} (modality_dropout={ck_dropout}). "
+                "Infer only with a modality the checkpoint actually saw in training."
+            )
         if use_ema and "model_ema" in ckpt:
             state = ckpt["model_ema"]
             logger.info("Loading EMA weights from %s", ckpt_path)
@@ -47,18 +70,9 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
     else:
         state = ckpt  # flat state_dict
         logger.info("Loading flat state_dict from %s", ckpt_path)
-    # Drop removed-feature keys (old CFG null conditions) so pre-removal
-    # checkpoints still load; any OTHER missing/unexpected key is still flagged.
-    state = drop_legacy_keys(state)
-    # strict=False only to tolerate non-persistent buffers (none are saved);
-    # any real missing/unexpected key means a wrong/incompatible checkpoint.
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            f"Checkpoint does not match the model architecture "
-            f"(missing={missing}, unexpected={unexpected}). "
-            "Use the config the checkpoint was trained with."
-        )
+    # Drops removed-feature keys (old CFG/meta), tolerates new params missing in
+    # older checkpoints (null tokens), and flags any real architecture mismatch.
+    load_model_state(model, state)
 
 
 @torch.no_grad()
@@ -117,7 +131,7 @@ def run_inference(args: argparse.Namespace) -> None:
         out = sample_abp(
             model, fm, batch["cond_patches"], generator=gen, device=device,
             abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std),
-            demo=demo,
+            demo=demo, cond_mask=batch.get("cond_mask"),
         )
         preds.append(out.cpu())
         gts.append(batch["abp_raw"].cpu())

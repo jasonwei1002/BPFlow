@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
         help="Pretrained checkpoint to initialize weights from (finetune); "
              "overrides training.init_from_ckpt.",
     )
+    parser.add_argument(
+        "--resume", default=None,
+        help="Existing run dir (e.g. output/20260101_120000) to resume IN PLACE: "
+             "reuse it as the output dir, load checkpoint_latest.pth, and continue "
+             "the same SwanLab run. Overrides training.resume_dir.",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +45,8 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.init_ckpt is not None:
         cfg.training.init_from_ckpt = args.init_ckpt
+    if args.resume is not None:
+        cfg.training.resume_dir = args.resume
     trainer = Trainer(cfg)
     try:
         trainer.train()

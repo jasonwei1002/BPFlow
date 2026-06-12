@@ -6,6 +6,7 @@
 #   N GPUs:                      bash train.sh --nproc 4
 #   pick GPUs:                   CUDA_VISIBLE_DEVICES=0,1 bash train.sh --nproc 2
 #   override config / args:      bash train.sh --config bpflow/config/other.yaml
+#   resume an interrupted run:   bash train.sh --resume output/<YYYYMMDD_HHMMSS>
 set -euo pipefail
 cd "$(dirname "$0")"
 NPROC=gpu

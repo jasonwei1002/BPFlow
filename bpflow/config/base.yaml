@@ -27,6 +27,17 @@ data:
   abp_clip_low: 20.0
   abp_clip_high: 250.0
   cond_recenter: true
+  # input "direction": which signal(s) condition ABP. ecg_ppg = both (default);
+  # ecg = ECG only; ppg = PPG only. The absent stream is replaced by a learned
+  # null token in the model (via cond_mask), NOT zeroed — arch/params/ckpt shape
+  # stay identical across directions. train AND infer must use the same value.
+  cond_modality: ecg_ppg
+  # per-sample modality dropout (TRAIN only) → one unified model for all 3
+  # directions. Each train sample randomly keeps ecg_ppg/ecg/ppg (probs below,
+  # [ecg_ppg, ecg, ppg]); val/test/infer use the fixed cond_modality above.
+  # false = fixed cond_modality everywhere (the per-direction specialist setup).
+  modality_dropout: false
+  modality_dropout_probs: [0.34, 0.33, 0.33]  # [ecg_ppg, ecg, ppg] ~uniform (only used when modality_dropout: true)
   # clinical-metric TRUE source for infer.py (pred is always per-beat from the
   # generated wave): waveform = per-beat on the true ABP wave (no CSV, no
   # definitional offset) | csv = the CSV cuff [sbp,dbp,map] label | both = report
@@ -65,7 +76,7 @@ training:
   log_freq: 50
   ckpt_freq_epoch: 5
   val_freq_epoch: 5          # in-loop validation every N epochs (0 = off); saves checkpoint_best.pth
-  val_max_batches: 50        # cap val batches (sampling is the cost)
+  val_loss_max_batches: 50   # per-modality val flow-matching loss (val/loss_*): -1 = full val, 0 = off, N = cap/rank
   ema_decay: 0.9999
   use_ema: true
   output_dir: output
@@ -74,7 +85,7 @@ training:
   max_steps: -1
   use_swanlab: false        # SwanLab experiment logging (rank-0 only)
   swanlab_project: bpflow
-  swanlab_mode: cloud       # cloud | local | offline | disabled
+  swanlab_mode: online      # online | local | offline | disabled
   repeat_factor: 1
   run_test_after_train: false  # eval CalFree test after training (best EMA) + log test/*
   test_max_segments: -1        # cap test segments (-1 = all)

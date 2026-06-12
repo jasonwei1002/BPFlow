@@ -36,11 +36,55 @@ log = logging.getLogger(__name__)
 
 _DEMO_COLS = ["age", "gender", "height", "weight", "bmi"]
 _BP_COLS = ["sbp", "dbp", "map"]  # CSV cuff label -> optional clinical TRUE for eval
+MODALITY_ORDER = ("ecg_ppg", "ecg", "ppg")  # order of modality_dropout_probs
+# cond_mask = [ecg_present, ppg_present]; the model nulls the absent stream(s).
+MODALITY_MASK = {"ecg_ppg": (1.0, 1.0), "ecg": (1.0, 0.0), "ppg": (0.0, 1.0)}
+# single source of truth for the default per-sample dropout probs (~uniform,
+# order = MODALITY_ORDER); referenced by the config schema + dataset/infer fallbacks.
+DEFAULT_MODALITY_DROPOUT_PROBS = (0.34, 0.33, 0.33)
+
+
+def trained_modalities(
+    cond_modality: str,
+    modality_dropout: bool,
+    modality_dropout_probs: Optional[list] = None,
+) -> set:
+    """The set of conditioning directions a model was actually trained on.
+
+    ``modality_dropout`` True  -> every modality with prob > 0 (the unified case;
+    degenerate probs like [1,0,0] collapse to one direction). False -> just the
+    fixed ``{cond_modality}`` (specialist). Shared by the infer guard (which side
+    of the checkpoint is valid to evaluate) and the trainer's per-modality val
+    loss (which directions are worth logging).
+    """
+    if modality_dropout:
+        probs = (
+            list(modality_dropout_probs)
+            if modality_dropout_probs
+            else list(DEFAULT_MODALITY_DROPOUT_PROBS)
+        )
+        if len(probs) != len(MODALITY_ORDER):
+            raise ValueError(
+                f"modality_dropout_probs must have {len(MODALITY_ORDER)} entries "
+                f"(order {MODALITY_ORDER}), got {len(probs)}"
+            )
+        return {m for m, p in zip(MODALITY_ORDER, probs) if float(p) > 0}
+    return {str(cond_modality)}
 
 
 def _csv_path_for(npy_path: str) -> str:
     """Sibling CSV that is row-aligned to the npy (Train_Subset.npy -> .csv)."""
     return os.path.splitext(npy_path)[0] + ".csv"
+
+
+def _front_ratio(idx: np.ndarray, ratio: float) -> np.ndarray:
+    """Keep the front ``ratio`` fraction of an already-shuffled index array (at
+    least 1 element). ``ratio >= 1`` or an empty array is a no-op. Front-slicing a
+    shuffled pool makes smaller ratios nested subsets of larger ones — the single
+    definition of the finetune ``train_ratio`` data-efficiency knob."""
+    if ratio >= 1.0 or len(idx) == 0:
+        return idx
+    return idx[: max(1, int(round(ratio * len(idx))))]
 
 
 class PulseDBDataset(Dataset):
@@ -61,35 +105,56 @@ class PulseDBDataset(Dataset):
         abp_clip_low: float = 20.0,
         abp_clip_high: float = 250.0,
         cond_recenter: bool = True,
+        cond_modality: str = "ecg_ppg",
+        modality_dropout: bool = False,
+        modality_dropout_probs: Optional[list] = None,
         use_demo: bool = False,
         demo_consts: Optional[Dict[str, float]] = None,
         eval_true_source: str = "waveform",
         finetune: bool = False,
         finetune_val_fraction: float = 0.1,
         finetune_test_fraction: float = 0.1,
+        finetune_train_ratio: float = 1.0,
+        finetune_split_mode: str = "segment",
     ) -> None:
         super().__init__()
         if split not in ("train", "val", "test"):
             raise ValueError(f"split must be train/val/test, got {split}")
         if split_mode not in ("segment", "subject"):
             raise ValueError(f"split_mode must be segment/subject, got {split_mode}")
+        if cond_modality not in ("ecg", "ppg", "ecg_ppg"):
+            raise ValueError(f"cond_modality must be ecg/ppg/ecg_ppg, got {cond_modality}")
+        if not 0.0 < finetune_train_ratio <= 1.0:
+            raise ValueError(f"finetune_train_ratio must be in (0, 1], got {finetune_train_ratio}")
+        if finetune_split_mode not in ("segment", "stratified"):
+            raise ValueError(f"finetune_split_mode must be segment/stratified, got {finetune_split_mode}")
         self.arr = np.load(npy_path, mmap_mode="r")
         if self.arr.ndim != 3 or self.arr.shape[1] < 3:
             raise ValueError(f"expected (N,3,L) array at {npy_path}, got {self.arr.shape}")
         total = self.arr.shape[0]
 
         # Read the sibling CSV once if subject-split / demographics / CSV BP labels
-        # need it. Finetune never uses the subject split (it does a 3-way segment split).
-        # CSV BP is an eval TRUE only used by infer, so only val/test load it.
+        # need it. Non-finetune subject split needs it for train/val; finetune
+        # needs it (all splits) only in the per-subject `stratified` mode. CSV BP
+        # is an eval TRUE used by infer, so only val/test load it.
         need_subject = (not finetune) and split in ("train", "val") and split_mode == "subject"
+        need_finetune_subj = finetune and finetune_split_mode == "stratified"
+        needs_subject_col = need_subject or need_finetune_subj
         need_bp = eval_true_source in ("csv", "both") and split in ("val", "test")
         frame = None
-        if need_subject or use_demo or need_bp:
-            frame = self._read_csv(npy_path, total, need_subject, use_demo, need_bp)
+        if needs_subject_col or use_demo or need_bp:
+            frame = self._read_csv(npy_path, total, needs_subject_col, use_demo, need_bp)
 
-        if finetune:
+        if finetune and finetune_split_mode == "stratified":
+            assert frame is not None  # need_finetune_subj forced the CSV read above
+            self.indices = self._compute_finetune_indices_stratified(
+                split, frame["subject_id"].to_numpy(), split_seed,
+                finetune_val_fraction, finetune_test_fraction, finetune_train_ratio,
+            )
+        elif finetune:
             self.indices = self._compute_finetune_indices(
-                split, total, split_seed, finetune_val_fraction, finetune_test_fraction
+                split, total, split_seed, finetune_val_fraction,
+                finetune_test_fraction, finetune_train_ratio,
             )
         else:
             self.indices = self._compute_indices(
@@ -107,6 +172,23 @@ class PulseDBDataset(Dataset):
         self.abp_clip_low = abp_clip_low
         self.abp_clip_high = abp_clip_high
         self.cond_recenter = cond_recenter
+        self.cond_modality = cond_modality
+        # Per-sample modality dropout is a TRAIN-only augmentation; val/test keep
+        # the fixed cond_modality so their metrics stay comparable.
+        self._dropout_active = bool(modality_dropout) and split == "train"
+        self._dropout_probs = None
+        if self._dropout_active:
+            probs = (
+                list(modality_dropout_probs)
+                if modality_dropout_probs
+                else list(DEFAULT_MODALITY_DROPOUT_PROBS)
+            )
+            if len(probs) != len(MODALITY_ORDER) or any(p < 0 for p in probs) or sum(probs) <= 0:
+                raise ValueError(
+                    f"modality_dropout_probs must be {len(MODALITY_ORDER)} non-negative "
+                    f"values (order {MODALITY_ORDER}) summing > 0, got {probs}"
+                )
+            self._dropout_probs = torch.tensor(probs, dtype=torch.float32)
         self.use_demo = use_demo
 
         self.demo_cont = None
@@ -121,7 +203,12 @@ class PulseDBDataset(Dataset):
             bp = np.stack([frame[c].to_numpy(dtype=np.float32) for c in _BP_COLS], axis=1)
             self.bp_true = torch.from_numpy(bp[self.indices])  # (n, 3) [SBP, DBP, MAP] mmHg
 
-        mode = "finetune-3way" if finetune else split_mode
+        if finetune:
+            mode = f"finetune-3way-{finetune_split_mode}"
+            if split == "train" and finetune_train_ratio < 1.0:
+                mode += f"(train_ratio={finetune_train_ratio:g})"
+        else:
+            mode = split_mode
         log.info(
             "PulseDBDataset[%s] %s: %d/%d segments (mode=%s, seed=%d, val_frac=%.2f, demo=%s)",
             split, npy_path, len(self.indices), total, mode, split_seed,
@@ -176,13 +263,20 @@ class PulseDBDataset(Dataset):
         return np.sort(chosen)
 
     @staticmethod
-    def _compute_finetune_indices(split, total, split_seed, val_fraction, test_fraction):
+    def _compute_finetune_indices(
+        split, total, split_seed, val_fraction, test_fraction, train_ratio=1.0
+    ):
         """Deterministic 3-way per-segment split of a single npy (train/val/test).
 
         One fixed-seed shuffle, then contiguous slices: test = last
         ``test_fraction``, val = the ``val_fraction`` before it, train = the
         rest. The same seed across the three build calls makes the partition
         consistent and non-overlapping (no segment is in two splits).
+
+        ``train_ratio`` < 1 keeps only that fraction of the train split (a
+        data-efficiency knob). It slices the FRONT of the already-shuffled train
+        pool, so smaller ratios are nested subsets of larger ones, and val/test
+        are never subsampled — metrics stay comparable across ratios.
         """
         order = np.arange(total)
         np.random.default_rng(split_seed).shuffle(order)
@@ -195,12 +289,59 @@ class PulseDBDataset(Dataset):
                 f"test_frac={test_fraction}"
             )
         if split == "train":
-            chosen = order[:n_train]
+            chosen = _front_ratio(order[:n_train], train_ratio)
         elif split == "val":
             chosen = order[n_train:n_train + n_val]
         else:  # test
             chosen = order[n_train + n_val:]
         return np.sort(chosen)
+
+    @staticmethod
+    def _compute_finetune_indices_stratified(
+        split, sids, split_seed, val_fraction, test_fraction, train_ratio=1.0
+    ):
+        """Per-subject stratified 3-way split (train/val/test).
+
+        Each subject's own segments are split 8:1:1 individually, so every split
+        is segment-balanced across subjects. Subjects therefore OVERLAP all three
+        splits — this is NOT subject-disjoint (use it for balanced finetuning, not
+        as an honest generalization gate).
+
+        One global fixed-seed shuffle fixes each subject's internal order; then
+        per subject: test = last ``test_fraction``, val = the ``val_fraction``
+        before it, train = the rest. ``train_ratio`` < 1 keeps the FRONT fraction
+        of each subject's train segments (per-subject nested subsampling; val/test
+        untouched). A subject too small for a slice contributes 0 segments there.
+        The same seed across the three build calls keeps the partition consistent
+        and non-overlapping at the segment level.
+        """
+        sids = np.asarray(sids)
+        total = len(sids)
+        order = np.arange(total)
+        np.random.default_rng(split_seed).shuffle(order)
+        sids_shuf = sids[order]
+        chosen = []
+        for subj in np.unique(sids):
+            seg = order[sids_shuf == subj]  # this subject's segment idx, shuffled order
+            n_s = len(seg)
+            n_test = int(test_fraction * n_s)
+            n_val = int(val_fraction * n_s)
+            n_train = n_s - n_val - n_test
+            if split == "train":
+                sel = _front_ratio(seg[:n_train], train_ratio)
+            elif split == "val":
+                sel = seg[n_train:n_train + n_val]
+            else:  # test
+                sel = seg[n_train + n_val:]
+            if len(sel):
+                chosen.append(sel)
+        if not chosen:
+            raise ValueError(
+                f"stratified finetune split produced no '{split}' segments "
+                f"(val_frac={val_fraction}, test_frac={test_fraction}); subjects "
+                "likely have too few segments each for this slice."
+            )
+        return np.sort(np.concatenate(chosen))
 
     def _build_demo(self, frame, demo_consts: Dict[str, float]) -> None:
         def col(name: str) -> torch.Tensor:
@@ -227,11 +368,21 @@ class PulseDBDataset(Dataset):
             abp, self.abp_mean, self.abp_std, self.abp_clip_low, self.abp_clip_high
         )
         abp_patches = patchify(abp_norm, self.patch_size)  # (N, P)
-        cond_patches = build_cond_patches(ecg, ppg, self.patch_size, self.cond_recenter)  # (N,2P)
+        cond_patches = build_cond_patches(ecg, ppg, self.patch_size, self.cond_recenter)  # (N, 2P)
+        # TRAIN-only: draw this sample's modality (torch RNG → DataLoader seeds it
+        # per worker). Otherwise use the fixed cond_modality (val/test/infer). The
+        # choice becomes a cond_mask; the model nulls the absent stream(s).
+        if self._dropout_active:
+            assert self._dropout_probs is not None
+            modality = MODALITY_ORDER[int(torch.multinomial(self._dropout_probs, 1).item())]
+        else:
+            modality = self.cond_modality
+        cond_mask = torch.tensor(MODALITY_MASK[modality], dtype=torch.float32)  # (2,) [ecg, ppg]
 
         out = {
             "abp_patches": abp_patches,
             "cond_patches": cond_patches,
+            "cond_mask": cond_mask,  # (2,) [ecg_present, ppg_present] -> model nulls absent
             "abp_raw": abp,  # ground-truth mmHg waveform for eval (unclipped)
         }
         if self.bp_true is not None:
@@ -273,10 +424,17 @@ def build_dataset(cfg, split: str) -> PulseDBDataset:
         abp_clip_low=float(d.abp_clip_low),
         abp_clip_high=float(d.abp_clip_high),
         cond_recenter=bool(d.cond_recenter),
+        cond_modality=str(getattr(d, "cond_modality", "ecg_ppg")),
+        modality_dropout=bool(getattr(d, "modality_dropout", False)),
+        modality_dropout_probs=(
+            list(d.modality_dropout_probs) if getattr(d, "modality_dropout_probs", None) else None
+        ),
         use_demo=bool(cfg.model.use_demo),
         demo_consts=demo_consts,
         eval_true_source=str(getattr(d, "eval_true_source", "waveform")),
         finetune=finetune,
         finetune_val_fraction=float(getattr(d, "finetune_val_fraction", 0.1)),
         finetune_test_fraction=float(getattr(d, "finetune_test_fraction", 0.1)),
+        finetune_train_ratio=float(getattr(d, "finetune_train_ratio", 1.0)),
+        finetune_split_mode=str(getattr(d, "finetune_split_mode", "segment")),
     )

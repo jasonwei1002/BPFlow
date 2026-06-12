@@ -4,7 +4,14 @@ from typing import Callable, Dict
 
 from torch.utils.data import Dataset
 
-from .pulsedb_dataset import PulseDBDataset, build_dataset
+from .pulsedb_dataset import (
+    DEFAULT_MODALITY_DROPOUT_PROBS,
+    MODALITY_MASK,
+    MODALITY_ORDER,
+    PulseDBDataset,
+    build_dataset,
+    trained_modalities,
+)
 from .transforms import (
     DEMO_CONT_DIM,
     build_cond_patches,
@@ -31,6 +38,10 @@ def register_dataset(name: str) -> Callable[[Callable[..., Dataset]], Callable[.
 __all__ = [
     "PulseDBDataset",
     "build_dataset",
+    "MODALITY_ORDER",
+    "MODALITY_MASK",
+    "DEFAULT_MODALITY_DROPOUT_PROBS",
+    "trained_modalities",
     "DATASET_REGISTRY",
     "register_dataset",
     "standardize_abp",

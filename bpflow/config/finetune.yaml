@@ -1,7 +1,8 @@
 # Finetune config: adapt a pretrained model to the CalFree domain.
 # Inherits the gpu.yaml architecture; the CalFree `test_npy` is split 8:1:1
-# (per-segment, fixed seed) into train/val/test. Finetune runs on the 80% train,
-# validates on the 10% val, and the post-train test runs on the held-out 10% test.
+# (per-segment, fixed seed) into train/val/test. Finetune runs on the 80% train and
+# validates on the 10% val for early stopping; it produces weights only and does NOT
+# auto-test. Score the held-out 10% test split separately: bash infer.sh <ckpt>.
 #
 # The `training` block below mirrors gpu.yaml so finetune hyperparameters can be
 # tuned independently here (e.g. a smaller lr / fewer epochs for finetuning)
@@ -17,6 +18,13 @@ data:
   finetune: true            # split test_npy (CalFree) 8:1:1 into train/val/test
   finetune_val_fraction: 0.1
   finetune_test_fraction: 0.1
+  finetune_train_ratio: 1.0   # fraction of the finetune-train split to use
+                              # (data-efficiency study): 1.0 = all, 0.25 = 25%.
+                              # val/test unaffected → metrics stay comparable.
+  finetune_split_mode: stratified  # segment = per-segment random (subjects leak);
+                                   # stratified = split each subject's segments
+                                   # 8:1:1 → segment-balanced per subject (subjects
+                                   # still overlap; needs sibling CSV for subject_id).
 
 training:
   # --- finetune hyperparameters (currently identical to gpu.yaml; tune freely) ---
@@ -30,13 +38,16 @@ training:
   use_ema: true
   max_steps: -1
   val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
-  val_max_batches: -1        # full val split (DDP-sharded across GPUs; -1 = all)
+  val_eval_fraction: 1.0     # full val (override gpu.yaml's 0.1): finetune val is
+                             # small (~11k segments), so full eval is cheap and gives
+                             # cleaner best-ckpt decisions
+  val_loss_max_batches: -1   # per-modality val flow-matching loss on the FULL val split (-1 = all)
   lr_patience: 5             # epochs w/o val improvement -> lr x lr_decay
   lr_decay: 0.1
   early_stop_patience: 10    # epochs w/o val improvement -> stop
   use_swanlab: true
   swanlab_project: bpflow
-  swanlab_mode: cloud        # cloud | local | offline | disabled
+  swanlab_mode: online       # online | local | offline | disabled
   # --- finetune-specific ---
   run_test_after_train: false # training produces weights only; test the held-out 10%
                               # separately with: bash infer.sh <ckpt> (uses finetune.yaml)

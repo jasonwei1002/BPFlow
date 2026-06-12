@@ -25,12 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
-def _sample_mmhg(model, fm, cond, gen, device, cfg) -> torch.Tensor:
+def _sample_mmhg(model, fm, cond, gen, device, cfg, cond_mask=None) -> torch.Tensor:
     """Eval-mode ABP sample in mmHg for the overfit set."""
     model.eval()
     out = sample_abp(
         model, fm, cond, generator=gen, device=device,
         abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std),
+        cond_mask=cond_mask,
     )
     model.train()
     return out
@@ -47,6 +48,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
     items = [ds[i] for i in range(n_samples)]
     abp = torch.stack([it["abp_patches"] for it in items]).to(device)
     cond = torch.stack([it["cond_patches"] for it in items]).to(device)
+    cond_mask = torch.stack([it["cond_mask"] for it in items]).to(device)
     abp_gt = torch.stack([it["abp_raw"] for it in items])  # (B,L) mmHg
 
     model = build_model(cfg).to(device)
@@ -57,7 +59,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
 
     # baseline (untrained) reconstruction
     gen.manual_seed(123)
-    pred0 = _sample_mmhg(model, fm, cond, gen, device, cfg)
+    pred0 = _sample_mmhg(model, fm, cond, gen, device, cfg, cond_mask)
     mae0 = (pred0 - abp_gt).abs().mean().item()
 
     losses = []
@@ -67,6 +69,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
             model, fm, abp, cond, generator=gen,
             logit_mean=float(cfg.sampling.logit_mean), logit_scale=float(cfg.sampling.logit_scale),
             prediction_type=str(cfg.sampling.prediction_type), loss_type=str(cfg.training.loss_type),
+            cond_mask=cond_mask,
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -80,7 +83,7 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
     final_loss = sum(losses[-10:]) / 10
 
     gen.manual_seed(123)
-    pred1 = _sample_mmhg(model, fm, cond, gen, device, cfg)
+    pred1 = _sample_mmhg(model, fm, cond, gen, device, cfg, cond_mask)
     mae1 = (pred1 - abp_gt).abs().mean().item()
     report = evaluate(pred1, abp_gt)
 
