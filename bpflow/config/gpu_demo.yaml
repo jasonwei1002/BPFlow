@@ -1,0 +1,20 @@
+# Pretraining config WITH demographics prior (use_demo: true).
+# Identical to gpu.yaml in every architecture/training field except it turns the
+# demographics prior ON, so it matches checkpoints trained with demographics.
+#
+# Use it to:
+#   - launch a fresh w-demo pretrain:
+#       torchrun --nproc_per_node=gpu -m bpflow.train --config bpflow/config/gpu_demo.yaml
+#   - RESUME a crashed w-demo pretrain (config arch must match the checkpoint,
+#     which carries demo_encoder.* — gpu.yaml's use_demo:false would RuntimeError):
+#       torchrun --nproc_per_node=gpu -m bpflow.train \
+#         --config bpflow/config/gpu_demo.yaml --resume output/<w_demo_ts>
+#
+# Demographics need the sibling CSV (<npy_basename>.csv) for age/gender/height/
+# weight/bmi; DemoEncoder's last layer is zero-init so enabling demo starts as a
+# no-op and only the global_c add-on is learned.
+
+_base_: gpu.yaml
+
+model:
+  use_demo: true            # demographics prior ON (overrides gpu.yaml's false)
