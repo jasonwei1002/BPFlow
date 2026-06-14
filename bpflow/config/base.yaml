@@ -35,8 +35,9 @@ data:
   # per-sample modality dropout (TRAIN only) → one unified model for all 3
   # directions. Each train sample randomly keeps ecg_ppg/ecg/ppg (probs below,
   # [ecg_ppg, ecg, ppg]); val/test/infer use the fixed cond_modality above.
-  # false = fixed cond_modality everywhere (the per-direction specialist setup).
-  modality_dropout: false
+  # true = UNIFIED default (one model serves all 3 directions); set false here
+  # for the per-direction specialist setup. Inherited by gpu/finetune/smoke.
+  modality_dropout: true
   modality_dropout_probs: [0.34, 0.33, 0.33]  # [ecg_ppg, ecg, ppg] ~uniform (only used when modality_dropout: true)
   # clinical-metric TRUE source for infer.py (pred is always per-beat from the
   # generated wave): waveform = per-beat on the true ABP wave (no CSV, no

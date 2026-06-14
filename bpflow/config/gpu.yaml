@@ -15,6 +15,7 @@ model:
 
 data:
   split_mode: segment       # random per-segment train/val split (subjects shared across split)
+  # modality_dropout: true is now the base.yaml default (UNIFIED model) → inherited here.
 
 training:
   epochs: 200
