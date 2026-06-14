@@ -49,9 +49,12 @@ training:
   swanlab_project: bpflow
   swanlab_mode: online       # online | local | offline | disabled
   # --- finetune-specific ---
-  run_test_after_train: true  # auto-test the best-by-val (EMA) ckpt on the held-out
-                              # 10% after training; logs both BP truth sources to
-                              # SwanLab: test/* (per-beat on the true wave) and
-                              # test/cuff_* (CSV cuff label) + writes test_metrics.json
+  run_test_after_train: false  # OFF: the in-process post-train test runs under DDP
+                              # and can deadlock (a per-rank failure in run_test before
+                              # its all_gather is swallowed by _maybe_run_test's
+                              # try/except -> surviving ranks hang -> CRASHED, losing
+                              # the run). Score the held-out 10% test separately and
+                              # safely with: bash infer.sh <ckpt> --nproc 1 --true-source both
+                              # (single-process, no collective, dual BP truth).
   test_max_segments: -1      # all test-split segments (DDP-sharded; -1 = all)
   # init_from_ckpt is supplied at launch via finetune.sh / --init-ckpt
