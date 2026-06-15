@@ -18,7 +18,7 @@ data:
   # modality_dropout: true is now the base.yaml default (UNIFIED model) → inherited here.
 
 training:
-  epochs: 500
+  epochs: 1000               # ceiling only; early_stop_patience + plateau decay end runs sooner
   batch_size: 128            # per-GPU (DDP global = 128 x num_gpus)
   num_workers: 8
   lr: 3.0e-4               # 8 GPUs x bs128 = global 1024; sqrt-scaled from 1e-4@128 (~2.8e-4)
