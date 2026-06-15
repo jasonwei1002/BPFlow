@@ -30,7 +30,8 @@ training:
   # --- finetune hyperparameters (currently identical to gpu.yaml; tune freely) ---
   epochs: 1000               # ceiling only; early stop + plateau decay end runs sooner
   batch_size: 128            # per-GPU (DDP global = 128 x num_gpus)
-  num_workers: 8
+  num_workers: 2             # PER RANK (see gpu.yaml): 8 GPUs x 16 cores -> 2/rank avoids the
+                             # train+val worker oversubscription that OOM-killed a worker at val.
   lr: 3.0e-4                 # finetune lr — often lowered (e.g. 3e-5) vs pretraining
   warmup_steps: 1000
   device: cuda
