@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from .data import MODALITY_MASK, MODALITY_ORDER, build_dataset, trained_modalities
-from .eval import evaluate, format_report
+from .eval import evaluate, format_report, segment_bp
 from .model import build_model
 from .sampling import build_flow_matching, sample_abp
 from .trainer_utils import load_config, load_model_state, pick_device, set_seed
@@ -246,6 +246,15 @@ def run_inference(args: argparse.Namespace) -> None:
                 logger.info("waveforms -> %s", out_dir)
             if args.plot > 0:
                 _plot(pred, gt, out_dir, args.plot, suffix)
+            if args.bland_altman:
+                # Per-beat BP agreement, one figure per truth source (mirrors the
+                # report keys). pred_bp is computed once and reused across sources.
+                pred_bp = segment_bp(pred)
+                if source in ("waveform", "both"):
+                    _bland_altman(pred_bp, segment_bp(gt), out_dir, f"waveform{suffix}")
+                if source in ("csv", "both"):  # bp guaranteed non-None by _build_reports
+                    true_csv = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]}
+                    _bland_altman(pred_bp, true_csv, out_dir, f"csv{suffix}")
         except Exception as e:  # noqa: BLE001 — defer until all collectives are done
             deferred_error = deferred_error or e
 
@@ -287,6 +296,45 @@ def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int, suffix: s
         logger.warning("plot skipped: %s", e)
 
 
+def _bland_altman(pred_bp: dict, true_bp: dict, out_dir: Path, name: str) -> None:
+    """3-panel (SBP/DBP/MAP) Bland-Altman agreement plot.
+
+    Per BP value: x = (pred+true)/2, y = pred-true; horizontal lines mark the bias
+    (mean diff) and the 95% limits of agreement (bias +/- 1.96 SD). ``name`` is the
+    truth source + modality suffix, e.g. ``waveform`` / ``csv_ecg``.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        keys = ("SBP", "DBP", "MAP")
+        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+        for ax, key in zip(axes, keys):
+            p = pred_bp[key].float().numpy()
+            t = true_bp[key].float().numpy()
+            mean = (p + t) / 2.0
+            diff = p - t
+            bias = float(diff.mean())
+            sd = float(diff.std(ddof=1)) if diff.size > 1 else 0.0
+            hi, lo = bias + 1.96 * sd, bias - 1.96 * sd
+            ax.scatter(mean, diff, s=6, alpha=0.3, edgecolors="none")
+            ax.axhline(bias, color="C1", lw=1.2, label=f"bias {bias:+.2f}")
+            ax.axhline(hi, color="C3", ls="--", lw=1.0, label=f"+1.96SD {hi:+.2f}")
+            ax.axhline(lo, color="C3", ls="--", lw=1.0)
+            ax.set_title(f"{key}  (n={diff.size})")
+            ax.set_xlabel("mean of pred & true (mmHg)")
+            ax.set_ylabel("pred - true (mmHg)")
+            ax.legend(loc="upper right", fontsize=7)
+        fig.tight_layout()
+        path = out_dir / f"bland_altman_{name}.png"
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+        logger.info("Bland-Altman -> %s", path)
+    except Exception as e:
+        logger.warning("Bland-Altman skipped: %s", e)
+
+
 def main() -> None:
     rank = int(os.environ.get("RANK", 0))  # only rank 0 prints INFO under torchrun
     logging.basicConfig(
@@ -315,6 +363,9 @@ def main() -> None:
     ap.add_argument("--out", default="output/infer")
     ap.add_argument("--save-waveforms", action="store_true")
     ap.add_argument("--plot", type=int, default=6, help="num example plots (0 = none)")
+    ap.add_argument("--bland-altman", action=argparse.BooleanOptionalAction, default=True,
+                    help="SBP/DBP/MAP Bland-Altman agreement plot per truth source "
+                         "(--no-bland-altman to skip)")
     args = ap.parse_args()
     run_inference(args)
 
