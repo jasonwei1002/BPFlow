@@ -21,7 +21,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from .data import build_dataset, trained_modalities
+from .data import MODALITY_MASK, MODALITY_ORDER, build_dataset, trained_modalities
 from .eval import evaluate, format_report
 from .model import build_model
 from .sampling import build_flow_matching, sample_abp
@@ -30,7 +30,7 @@ from .trainer_utils import load_config, load_model_state, pick_device, set_seed
 logger = logging.getLogger(__name__)
 
 
-def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) -> None:
+def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) -> set:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict) and "model" in ckpt:
         # assert normalization constants match (else denormalized mmHg is biased)
@@ -40,9 +40,9 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
                     f"{key} mismatch: ckpt={ckpt[key]} cfg={getattr(cfg.data, key)}. "
                     "Use the config the checkpoint was trained with."
                 )
-        # Only infer with a modality the checkpoint actually TRAINED on — else the
-        # absent stream's null token is in an unseen state and the output is junk.
-        # The trained set is:
+        # The set of directions the checkpoint actually TRAINED on (caller picks
+        # which to infer; inferring an untrained direction would feed the absent
+        # stream's null token an unseen state → junk output). The trained set is:
         #   - modality_dropout: every modality with prob > 0 (the unified case;
         #     degenerate probs like [1,0,0] correctly collapse to one direction).
         #   - specialist (no dropout): just the fixed cond_modality.
@@ -51,16 +51,9 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
         ck_data = ck_cfg.get("data", {}) if isinstance(ck_cfg, dict) else {}
         ck_modality = str(ck_data.get("cond_modality", "ecg_ppg"))
         ck_dropout = bool(ck_data.get("modality_dropout", False))
-        cfg_modality = str(getattr(cfg.data, "cond_modality", "ecg_ppg"))
         trained = trained_modalities(
             ck_modality, ck_dropout, ck_data.get("modality_dropout_probs")
         )
-        if cfg_modality not in trained:
-            raise ValueError(
-                f"cond_modality {cfg_modality!r} not in the checkpoint's trained "
-                f"modalities {sorted(trained)} (modality_dropout={ck_dropout}). "
-                "Infer only with a modality the checkpoint actually saw in training."
-            )
         if use_ema and "model_ema" in ckpt:
             state = ckpt["model_ema"]
             logger.info("Loading EMA weights from %s", ckpt_path)
@@ -68,11 +61,85 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
             state = ckpt["model"]
             logger.info("Loading model weights from %s", ckpt_path)
     else:
-        state = ckpt  # flat state_dict
+        state = ckpt  # flat state_dict (no config) → assume the historical default
+        trained = {"ecg_ppg"}
         logger.info("Loading flat state_dict from %s", ckpt_path)
     # Drops removed-feature keys (old CFG/meta), tolerates new params missing in
     # older checkpoints (null tokens), and flags any real architecture mismatch.
     load_model_state(model, state)
+    return trained
+
+
+def _build_reports(pred, gt, bp, source: str) -> dict:
+    """Clinical/waveform reports for one direction's gathered predictions.
+
+    ``source`` (waveform/csv/both) picks the BP TRUE: per-beat on the true wave
+    (``true_waveform``) and/or the CSV cuff label (``true_csv``). PRED is always
+    per-beat from the generated wave; waveform MAE/RMSE/Pearson are source-agnostic.
+    """
+    true_bp = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]} if bp is not None else None
+    if source in ("csv", "both") and true_bp is None:
+        raise RuntimeError(
+            f"eval_true_source={source!r} needs the CSV cuff label but no bp_true was "
+            "loaded (is the sibling CSV present and data.eval_true_source set?)."
+        )
+    reports: dict = {}
+    if source in ("waveform", "both"):
+        reports["true_waveform"] = evaluate(pred, gt)
+    if source in ("csv", "both"):
+        reports["true_csv"] = evaluate(pred, gt, true_bp)
+    return reports
+
+
+@torch.no_grad()
+def _sample_and_gather(modality, loader, model, fm, gen, device, cfg, seed,
+                       distributed, world_size, is_main, total):
+    """Sample the whole (sharded) loader for ONE input direction, gather to rank 0.
+
+    Overrides each batch's cond_mask with ``MODALITY_MASK[modality]`` so a single
+    dataset build serves every direction (cond_patches always carries both
+    streams; the model nulls the absent one). Re-seeds the generator so every
+    direction sees identical initial noise → a paired comparison. ALL ranks must
+    call this together — the all_gather is a collective. Returns ``(pred, gt, bp)``
+    on rank 0 (cuff ``bp`` may be None); ``(None, None, None)`` on other ranks.
+    """
+    gen.manual_seed(seed)  # same noise across directions → paired comparison
+    mask_row = torch.tensor(MODALITY_MASK[modality], dtype=torch.float32)
+    use_demo = bool(cfg.model.use_demo)
+    abp_mean, abp_std = float(cfg.data.abp_mean), float(cfg.data.abp_std)
+    preds, gts, bps = [], [], []
+    tag = f"infer:{modality} (rank0 shard of {total})" if distributed else f"infer:{modality} ({total})"
+    for batch in tqdm(loader, desc=tag, disable=not is_main):
+        demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
+        bs = batch["cond_patches"].shape[0]
+        out = sample_abp(
+            model, fm, batch["cond_patches"], generator=gen, device=device,
+            abp_mean=abp_mean, abp_std=abp_std,
+            demo=demo, cond_mask=mask_row.repeat(bs, 1),
+        )
+        preds.append(out.cpu())
+        gts.append(batch["abp_raw"].cpu())
+        if "bp_true" in batch:  # CSV cuff [SBP, DBP, MAP] -> clinical TRUE
+            bps.append(batch["bp_true"].cpu())
+    pred = torch.cat(preds, dim=0) if preds else None
+    gt = torch.cat(gts, dim=0) if gts else None
+    bp = torch.cat(bps, dim=0) if bps else None
+
+    if distributed:
+        import torch.distributed as dist
+
+        gathered: list = [None] * world_size
+        dist.all_gather_object(gathered, (pred, gt, bp))
+        dist.barrier()
+        if not is_main:
+            return None, None, None
+        pred_parts = [p for p, _, _ in gathered if p is not None]
+        gt_parts = [g for _, g, _ in gathered if g is not None]
+        bp_parts = [b for _, _, b in gathered if b is not None]
+        pred = torch.cat(pred_parts, dim=0) if pred_parts else None  # None if every shard empty
+        gt = torch.cat(gt_parts, dim=0) if gt_parts else None
+        bp = torch.cat(bp_parts, dim=0) if bp_parts else None
+    return pred, gt, bp
 
 
 @torch.no_grad()
@@ -117,83 +184,87 @@ def run_inference(args: argparse.Namespace) -> None:
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = build_model(cfg).to(device).eval()
-    _load_weights(model, args.ckpt, args.use_ema, cfg)
+    trained = _load_weights(model, args.ckpt, args.use_ema, cfg)
 
     fm = build_flow_matching(cfg)
     gen = torch.Generator(device=device)
-    gen.manual_seed(args.seed)
 
-    preds, gts, bps = [], [], []
-    use_demo = bool(cfg.model.use_demo)
-    desc = f"infer (rank0 shard of {total})" if distributed else f"infer ({total})"
-    for batch in tqdm(loader, desc=desc, disable=not is_main):
-        demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
-        out = sample_abp(
-            model, fm, batch["cond_patches"], generator=gen, device=device,
-            abp_mean=float(cfg.data.abp_mean), abp_std=float(cfg.data.abp_std),
-            demo=demo, cond_mask=batch.get("cond_mask"),
+    # Which input direction(s) to evaluate. 'all' (default) = every direction the
+    # checkpoint trained on (unified -> 3; specialist -> its 1); else the pinned
+    # one, which must be in the trained set (an untrained direction yields junk).
+    if args.cond_modality == "all":
+        modalities = [m for m in MODALITY_ORDER if m in trained]
+    elif args.cond_modality in trained:
+        modalities = [args.cond_modality]
+    else:
+        raise ValueError(
+            f"--cond-modality {args.cond_modality!r} not in the checkpoint's trained "
+            f"modalities {sorted(trained)}. Infer only a direction the checkpoint saw."
         )
-        preds.append(out.cpu())
-        gts.append(batch["abp_raw"].cpu())
-        if "bp_true" in batch:  # CSV cuff [SBP, DBP, MAP] -> clinical TRUE
-            bps.append(batch["bp_true"].cpu())
+    # Validate up front (BEFORE any collective) so every rank fails together — a
+    # late/asymmetric raise inside the modality loop would deadlock DDP.
+    if not modalities:  # e.g. a checkpoint whose modality_dropout_probs are all 0
+        raise ValueError(f"no trained directions to evaluate (trained={sorted(trained)})")
+    source = str(args.true_source or cfg.data.eval_true_source)
+    if source not in ("waveform", "csv", "both"):
+        raise ValueError(f"eval_true_source must be waveform/csv/both, got {source!r}")
 
-    pred = torch.cat(preds, dim=0) if preds else None
-    gt = torch.cat(gts, dim=0) if gts else None
-    bp = torch.cat(bps, dim=0) if bps else None
+    out_dir = Path(args.out)
+    multi = len(modalities) > 1
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("evaluating modalities %s [true=%s]", modalities, source)
+
+    # Every rank must enter _sample_and_gather for EVERY modality (its all_gather is
+    # a collective). So rank-0-only reporting is wrapped in try/except and the first
+    # error is DEFERRED: the loop keeps running (all collectives complete), the group
+    # is torn down, and only then is the error re-raised — a reporting failure (e.g.
+    # missing CSV under --true-source csv) can never strand the other ranks mid-loop.
+    results: dict = {}
+    deferred_error = None
+    for m in modalities:
+        pred, gt, bp = _sample_and_gather(
+            m, loader, model, fm, gen, device, cfg, args.seed,
+            distributed, world_size, is_main, total,
+        )
+        if not is_main:
+            continue  # keep looping so every direction's all_gather stays aligned
+        try:
+            if pred is None:
+                raise RuntimeError(f"no segments evaluated for modality {m!r}")
+            reports = _build_reports(pred, gt, bp, source)
+            results[m] = next(iter(reports.values())) if len(reports) == 1 else reports
+            logger.info("[%s] %d segments across %d process(es)", m, pred.shape[0], world_size)
+            for name, rep in reports.items():
+                logger.info("[%s/%s]\n%s", m, name, format_report(rep))
+            suffix = f"_{m}" if multi else ""
+            if args.save_waveforms:
+                import numpy as np
+
+                np.save(out_dir / f"pred_mmhg{suffix}.npy", pred.numpy())
+                np.save(out_dir / f"gt_mmhg{suffix}.npy", gt.numpy())
+                logger.info("waveforms -> %s", out_dir)
+            if args.plot > 0:
+                _plot(pred, gt, out_dir, args.plot, suffix)
+        except Exception as e:  # noqa: BLE001 — defer until all collectives are done
+            deferred_error = deferred_error or e
 
     if distributed:
         import torch.distributed as dist
 
-        gathered: list = [None] * world_size
-        dist.all_gather_object(gathered, (pred, gt, bp))
-        dist.barrier()
         dist.destroy_process_group()
-        if not is_main:
-            return
-        pred = torch.cat([p for p, _, _ in gathered if p is not None], dim=0)
-        gt = torch.cat([g for _, g, _ in gathered if g is not None], dim=0)
-        bp_parts = [b for _, _, b in gathered if b is not None]
-        bp = torch.cat(bp_parts, dim=0) if bp_parts else None
+    if not is_main:
+        return
+    if deferred_error is not None:
+        raise deferred_error
 
-    # Clinical TRUE source(s): waveform (per-beat on the true wave), csv (cuff label),
-    # or both. PRED is always per-beat from the generated wave.
-    source = str(args.true_source or cfg.data.eval_true_source)
-    true_bp = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]} if bp is not None else None
-    if source in ("csv", "both") and true_bp is None:
-        raise RuntimeError(
-            f"eval_true_source='{source}' needs the CSV cuff label but no bp_true was "
-            "loaded (is the sibling CSV present and data.eval_true_source set?)."
-        )
-    reports: dict = {}
-    if source in ("waveform", "both"):
-        reports["true_waveform"] = evaluate(pred, gt)
-    if source in ("csv", "both"):
-        reports["true_csv"] = evaluate(pred, gt, true_bp)
-    logger.info("evaluated %d segments across %d process(es) [true=%s]",
-                pred.shape[0], world_size, source)
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # single source -> flat report (back-compat); both -> {true_waveform, true_csv}
-    payload = next(iter(reports.values())) if len(reports) == 1 else reports
+    # single direction -> flat report (back-compat); multiple -> {modality: report}
+    payload = results[modalities[0]] if not multi else results
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2))
-    for name, rep in reports.items():
-        logger.info("[%s]\n%s", name, format_report(rep))
-    logger.info("metrics -> %s", out_dir / "metrics.json")
-
-    if args.save_waveforms:
-        import numpy as np
-
-        np.save(out_dir / "pred_mmhg.npy", pred.numpy())
-        np.save(out_dir / "gt_mmhg.npy", gt.numpy())
-        logger.info("waveforms -> %s", out_dir)
-
-    if args.plot > 0:
-        _plot(pred, gt, out_dir, args.plot)
+    logger.info("metrics (%s) -> %s", "+".join(modalities), out_dir / "metrics.json")
 
 
-def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int) -> None:
+def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int, suffix: str = "") -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -209,9 +280,9 @@ def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int) -> None:
             axes[j].set_ylabel("mmHg")
             axes[j].legend(loc="upper right", fontsize=8)
         fig.tight_layout()
-        fig.savefig(out_dir / "infer_recon.png", dpi=110)
+        fig.savefig(out_dir / f"infer_recon{suffix}.png", dpi=110)
         plt.close(fig)
-        logger.info("plot -> %s", out_dir / "infer_recon.png")
+        logger.info("plot -> %s", out_dir / f"infer_recon{suffix}.png")
     except Exception as e:
         logger.warning("plot skipped: %s", e)
 
@@ -226,6 +297,12 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
+    ap.add_argument("--cond-modality", default="all",
+                    choices=["all", "ecg_ppg", "ecg", "ppg"],
+                    help="input direction(s) to evaluate. 'all' (default) = every "
+                         "direction the checkpoint trained on (unified -> 3, "
+                         "specialist -> 1); or pin one. Each appears under its name "
+                         "in metrics.json when more than one is evaluated.")
     ap.add_argument("--num", type=int, default=-1, help="max segments (-1 = all)")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)

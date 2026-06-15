@@ -2,9 +2,13 @@
 # Evaluate a finetuned BPFlow checkpoint on the CalFree held-out test split
 # (finetune.yaml: data.finetune true -> the fixed-seed 10% of CalFree the finetune
 # never trained on). Single-node, multi-GPU via torchrun.
+# By default infers EVERY direction the checkpoint trained on (--cond-modality all):
+# a unified model -> ecg_ppg + ecg + ppg (nested per direction in metrics.json);
+# a specialist -> just its one direction (flat metrics.json, back-compat).
 # Args: <checkpoint> [--nproc <gpu|N>] [extra args...]   (--nproc default 'gpu')
 #   all visible GPUs (default):  bash infer.sh output/<ts>/checkpoint_best.pth
 #   N GPUs:                      bash infer.sh output/<ts>/checkpoint_best.pth --nproc 4
+#   pin one direction:           bash infer.sh <path> --cond-modality ecg_ppg
 #   extra args:                  bash infer.sh <path> --nproc 1 --num 100
 set -euo pipefail
 cd "$(dirname "$0")"
