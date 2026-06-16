@@ -114,6 +114,11 @@ class Trainer:
                 self.train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True
             )
         self.sampler = sampler
+        # Validation/test batch (eager sampler, no backward → safe to keep large even
+        # when batch_size is tiny). -1 = reuse the train batch_size. Shared by the val
+        # loader below and run_test's loader.
+        vbs = int(self.cfg.training.val_batch_size)
+        self.val_batch_size = vbs if vbs > 0 else int(self.cfg.training.batch_size)
         num_workers = int(self.cfg.training.num_workers)
         self.loader = DataLoader(
             self.train_ds,
@@ -153,7 +158,7 @@ class Trainer:
                 val_ds = Subset(val_ds, list(range(self.rank, len(val_ds), self.world_size)))
             self.val_loader = DataLoader(
                 val_ds,
-                batch_size=int(self.cfg.training.batch_size),
+                batch_size=self.val_batch_size,
                 shuffle=False,
                 num_workers=int(self.cfg.training.num_workers),
                 drop_last=False,
@@ -769,7 +774,7 @@ class Trainer:
             # Strided shard: exact coverage, no padding. Metrics are set-level.
             shard = Subset(test_ds, list(range(self.rank, total, self.world_size)))
         loader = DataLoader(
-            shard, batch_size=int(self.cfg.training.batch_size), shuffle=False,
+            shard, batch_size=self.val_batch_size, shuffle=False,
             num_workers=int(self.cfg.training.num_workers), pin_memory=self.is_cuda,
         )
         src = self._load_eval_weights(os.path.join(self.exp_dir, "checkpoint_best.pth"))

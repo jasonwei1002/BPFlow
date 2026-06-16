@@ -123,6 +123,10 @@ class TrainingConfig:
     loss_type: str = "v"  # 'x' or 'v'
     epochs: int = 100
     batch_size: int = 64
+    # Batch size for validation / test (eager sampler, no backward → safe to make
+    # large independent of the train batch). -1 = reuse batch_size. Set this larger
+    # than a tiny train batch_size so small-batch runs don't pay a slow validation.
+    val_batch_size: int = -1
     num_workers: int = 4
     lr: float = 1.0e-4
     weight_decay: float = 0.0

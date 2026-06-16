@@ -21,5 +21,7 @@ _base_: finetune.yaml
 training:
   batch_size: 4              # per-GPU; 8 GPUs -> global 32 (vs finetune.yaml's 256), so a
                              # ~837-segment 1% split still gives ~26 grad steps/epoch
+  val_batch_size: 64         # val/test sampler is eager + no backward -> keep it large
+                             # so the tiny train batch_size doesn't slow validation
   warmup_steps: 20           # tiny split -> warmup must finish within ~1 epoch
                              # (finetune.yaml's 1000 would need hundreds of epochs here)
