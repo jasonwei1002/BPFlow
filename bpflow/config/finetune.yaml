@@ -27,12 +27,12 @@ data:
                                    # still overlap; needs sibling CSV for subject_id).
 
 training:
-  # --- finetune hyperparameters (lowered lr + smaller batch vs gpu.yaml; tune freely) ---
+  # --- finetune hyperparameters (currently identical to gpu.yaml; tune freely) ---
   epochs: 1000               # ceiling only; early stop + plateau decay end runs sooner
-  batch_size: 32            # per-GPU (DDP global = 32 x num_gpus)
+  batch_size: 64            # per-GPU (DDP global = 64 x num_gpus)
   num_workers: 2             # PER RANK (see gpu.yaml): 8 GPUs x 16 cores -> 2/rank avoids the
                              # train+val worker oversubscription that OOM-killed a worker at val.
-  lr: 1.0e-4                 # finetune lr 
+  lr: 2.0e-4                 # finetune lr 
   warmup_steps: 1000
   device: cuda
   amp_dtype: bfloat16
