@@ -8,6 +8,8 @@
 #   --true-source both  : BOTH clinical truths — per-beat on the true wave (true_waveform)
 #                         AND the CSV cuff label (true_csv). Needs the sibling CSV (CalFree
 #                         has it); override with --true-source waveform for wave-only.
+#   --plot 3            : recon figure with 3 example GT-vs-gen samples per direction
+#                         (infer_recon[_<modality>].png); override with --plot N / --plot 0.
 # Args: <checkpoint> [--nproc <gpu|N>] [extra args...]   (--nproc default 'gpu')
 #   all visible GPUs (default):  bash infer.sh output/<ts>/checkpoint_best.pth
 #   N GPUs:                      bash infer.sh output/<ts>/checkpoint_best.pth --nproc 4
@@ -29,4 +31,4 @@ set -- ${rest[@]+"${rest[@]}"}
 CKPT="${1:?pass a checkpoint: bash infer.sh <path> [--nproc N]}"; shift
 torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.infer \
   --config bpflow/config/finetune.yaml --ckpt "$CKPT" \
-  --split test --num -1 --use-ema --true-source both "$@"
+  --split test --num -1 --use-ema --true-source both --plot 3 "$@"

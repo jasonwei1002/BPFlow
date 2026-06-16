@@ -238,6 +238,7 @@ def run_inference(args: argparse.Namespace) -> None:
             for name, rep in reports.items():
                 logger.info("[%s/%s]\n%s", m, name, format_report(rep))
             suffix = f"_{m}" if multi else ""
+            arrow = f"{m.upper().replace('_', '+')} → ABP"  # e.g. "ECG+PPG -> ABP"
             if args.save_waveforms:
                 import numpy as np
 
@@ -245,16 +246,18 @@ def run_inference(args: argparse.Namespace) -> None:
                 np.save(out_dir / f"gt_mmhg{suffix}.npy", gt.numpy())
                 logger.info("waveforms -> %s", out_dir)
             if args.plot > 0:
-                _plot(pred, gt, out_dir, args.plot, suffix)
+                _plot(pred, gt, out_dir, args.plot, suffix, title=arrow)
             if args.bland_altman:
                 # Per-beat BP agreement, one figure per truth source (mirrors the
                 # report keys). pred_bp is computed once and reused across sources.
                 pred_bp = segment_bp(pred)
                 if source in ("waveform", "both"):
-                    _bland_altman(pred_bp, segment_bp(gt), out_dir, f"waveform{suffix}")
+                    _bland_altman(pred_bp, segment_bp(gt), out_dir, f"waveform{suffix}",
+                                  title=f"{arrow}  (waveform truth)")
                 if source in ("csv", "both"):  # bp guaranteed non-None by _build_reports
                     true_csv = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]}
-                    _bland_altman(pred_bp, true_csv, out_dir, f"csv{suffix}")
+                    _bland_altman(pred_bp, true_csv, out_dir, f"csv{suffix}",
+                                  title=f"{arrow}  (cuff truth)")
         except Exception as e:  # noqa: BLE001 — defer until all collectives are done
             deferred_error = deferred_error or e
 
@@ -273,7 +276,8 @@ def run_inference(args: argparse.Namespace) -> None:
     logger.info("metrics (%s) -> %s", "+".join(modalities), out_dir / "metrics.json")
 
 
-def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int, suffix: str = "") -> None:
+def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int,
+          suffix: str = "", title: str = "") -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -288,20 +292,24 @@ def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int, suffix: s
             axes[j].plot(pred[j].numpy(), label="gen", lw=1.0, alpha=0.8)
             axes[j].set_ylabel("mmHg")
             axes[j].legend(loc="upper right", fontsize=8)
-        fig.tight_layout()
-        fig.savefig(out_dir / f"infer_recon{suffix}.png", dpi=110)
+        if title:
+            fig.suptitle(title)
+        fig.tight_layout(rect=(0, 0, 1, 0.97) if title else None)
+        fig.savefig(out_dir / f"infer_recon{suffix}.png", dpi=300)
         plt.close(fig)
         logger.info("plot -> %s", out_dir / f"infer_recon{suffix}.png")
     except Exception as e:
         logger.warning("plot skipped: %s", e)
 
 
-def _bland_altman(pred_bp: dict, true_bp: dict, out_dir: Path, name: str) -> None:
+def _bland_altman(pred_bp: dict, true_bp: dict, out_dir: Path, name: str,
+                  title: str = "") -> None:
     """3-panel (SBP/DBP/MAP) Bland-Altman agreement plot.
 
     Per BP value: x = (pred+true)/2, y = pred-true; horizontal lines mark the bias
     (mean diff) and the 95% limits of agreement (bias +/- 1.96 SD). ``name`` is the
-    truth source + modality suffix, e.g. ``waveform`` / ``csv_ecg``.
+    truth source + modality suffix, e.g. ``waveform`` / ``csv_ecg``; ``title`` is the
+    figure suptitle (e.g. "ECG+PPG -> ABP  (cuff truth)").
     """
     try:
         import matplotlib
@@ -326,9 +334,11 @@ def _bland_altman(pred_bp: dict, true_bp: dict, out_dir: Path, name: str) -> Non
             ax.set_xlabel("mean of pred & true (mmHg)")
             ax.set_ylabel("pred - true (mmHg)")
             ax.legend(loc="upper right", fontsize=7)
-        fig.tight_layout()
+        if title:
+            fig.suptitle(title)
+        fig.tight_layout(rect=(0, 0, 1, 0.95) if title else None)
         path = out_dir / f"bland_altman_{name}.png"
-        fig.savefig(path, dpi=110)
+        fig.savefig(path, dpi=300)
         plt.close(fig)
         logger.info("Bland-Altman -> %s", path)
     except Exception as e:
