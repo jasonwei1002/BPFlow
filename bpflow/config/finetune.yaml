@@ -43,9 +43,10 @@ training:
                              # small (~11k segments), so full eval is cheap and gives
                              # cleaner best-ckpt decisions
   val_loss_max_batches: -1   # per-modality val flow-matching loss on the FULL val split (-1 = all)
-  lr_patience: 5             # epochs w/o val improvement -> lr x lr_decay
+  lr_patience: 8             # raised for the unified model (slow/noisy fixed-direction val);
+                             # less than gpu.yaml's 10 since finetune val is full (less noisy)
   lr_decay: 0.1
-  early_stop_patience: 10    # epochs w/o val improvement -> stop
+  early_stop_patience: 16    # >= 2x lr_patience; unified finetune improves late (best @ep260)
   use_swanlab: true
   swanlab_project: bpflow
   swanlab_mode: online       # online | local | offline | disabled

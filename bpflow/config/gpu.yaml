@@ -35,9 +35,14 @@ training:
                              # (covers all subjects; fixed across epochs) — enough to
                              # track the MAE trend at ~10x cheaper validation
   val_loss_max_batches: -1   # per-modality val flow-matching loss on the FULL val split (-1 = all)
-  lr_patience: 5             # 5 epochs w/o val improvement -> lr x lr_decay
-  lr_decay: 0.1              # "下降10倍"
-  early_stop_patience: 10    # 10 epochs w/o val improvement -> stop
+  lr_patience: 10            # epochs w/o val improvement -> lr x lr_decay. Raised for the
+                             # UNIFIED model: val tracks only ecg_ppg, which gets ~1/3 of
+                             # updates (modality_dropout) + a noisy 10%-subsampled val, so
+                             # patience 5 collapsed lr prematurely (dragon-6 hit 3e-8 while
+                             # still improving at ep248).
+  lr_decay: 0.3              # gentler than 0.1 so an early plateau-decay isn't fatal
+  early_stop_patience: 20    # >= 2x lr_patience so lr can decay 1-2x before stopping;
+                             # unified runs improve late (Run B best @ep260/269)
   use_swanlab: true
   swanlab_project: bpflow
   swanlab_mode: online      # online | local | offline | disabled
