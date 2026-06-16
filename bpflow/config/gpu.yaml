@@ -6,7 +6,7 @@
 _base_: base.yaml
 
 model:
-  patch_size: 10
+  patch_size: 5
   hidden_dim: 512
   num_heads: 8
   depth: 12
