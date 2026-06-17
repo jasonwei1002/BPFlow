@@ -6,7 +6,7 @@
 _base_: base.yaml
 
 model:
-  patch_size: 5
+  patch_size: 10
   hidden_dim: 512
   num_heads: 8
   depth: 12
@@ -19,12 +19,12 @@ data:
 
 training:
   epochs: 1000               # ceiling only; early_stop_patience + plateau decay end runs sooner
-  batch_size: 64            # per-GPU (DDP global = 64 x num_gpus)
+  batch_size: 128            # per-GPU (DDP global = 128 x num_gpus)
   num_workers: 2             # PER RANK -> total = num_workers x num_gpus x (train + val).
                              # Tuned for an 8-GPU / 16-core node (~2 cores/rank): 8 left the
                              # train (persistent) + val workers oversubscribing 16 cores and
                              # OOM-killing a worker at validation. Raise on fatter nodes.
-  lr: 2.0e-4               # 8 GPUs x bs64 = global 512
+  lr: 3.0e-4               # 8 GPUs x bs128 = global 1024
   warmup_steps: 1000
   device: cuda
   amp_dtype: bfloat16
