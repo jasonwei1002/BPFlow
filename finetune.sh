@@ -10,6 +10,11 @@
 #   N GPUs:                      bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4
 #   override config / args:      bash finetune.sh <path> --nproc 4 --config bpflow/config/other.yaml
 #   override a config field:     bash finetune.sh <path> data.finetune_train_ratio=0.25 training.lr=3e-5
+
+# 训练单模态ECG与PPG
+# bash finetune.sh output/<ecg_pretrain_ts>/checkpoint_best.pth data.modality_dropout=false data.cond_modality=ecg
+# bash finetune.sh output/<ppg_pretrain_ts>/checkpoint_best.pth data.modality_dropout=false data.cond_modality=ppg
+
 set -euo pipefail
 cd "$(dirname "$0")"
 NPROC=gpu
