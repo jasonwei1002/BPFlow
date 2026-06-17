@@ -8,6 +8,12 @@
 #   override config / args:      bash train.sh --config bpflow/config/other.yaml
 #   override a config field:     bash train.sh training.lr=1e-4 model.use_demo=true
 #   resume an interrupted run:   bash train.sh --resume output/<YYYYMMDD_HHMMSS>
+
+# ECG单模态训练命令
+# bash train.sh --config bpflow/config/gpu_ecg.yaml
+
+# PPG单模态训练命令
+# bash train.sh --config bpflow/config/gpu_ppg.yaml
 set -euo pipefail
 cd "$(dirname "$0")"
 NPROC=gpu
