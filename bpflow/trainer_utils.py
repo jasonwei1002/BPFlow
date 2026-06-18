@@ -153,6 +153,12 @@ class TrainingConfig:
     lr_patience: int = 5       # val rounds w/o val improvement before lr *= lr_decay
     lr_decay: float = 0.1      # lr multiplier applied on each plateau
     early_stop_patience: int = 10  # val rounds w/o val improvement before stopping
+    # Minimum val-MAE drop (mmHg) that counts as an "improvement" for the patience
+    # counters above. checkpoint_best still saves on ANY new low; this only gates
+    # the counter reset, so a noise-level new low (val is a subsampled split) no
+    # longer keeps resetting patience -> early stop fires once per-epoch gain drops
+    # below min_delta for early_stop_patience rounds. 0.0 = old strict-`<` behavior.
+    min_delta: float = 0.0
     output_dir: str = "output"
     device: str = "auto"  # 'auto' | 'cpu' | 'cuda'
     use_swanlab: bool = False  # log metrics to SwanLab (rank-0 only)

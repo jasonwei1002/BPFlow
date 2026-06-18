@@ -478,16 +478,26 @@ class Trainer:
         # is logged to SwanLab with step=done_epochs (epoch x-axis).
         val_mae = self.validate(done_epochs)
         if is_main_process():
-            if val_mae < self.best_val:
+            # checkpoint_best tracks the literal best (deploy/eval uses it), but only a
+            # >= min_delta drop RESETS patience. Without min_delta a noise-level new low
+            # (val is a subsampled split) reset the counter every few epochs, so early
+            # stop never fired on a slow tail. Both tests use the OLD best_val, so the
+            # reset condition is "this epoch beat the running min by >= min_delta" -> the
+            # run stops once per-epoch gain stays below min_delta for early_stop_patience.
+            min_delta = float(self.cfg.training.min_delta)
+            improved = val_mae < self.best_val
+            significant = val_mae < self.best_val - min_delta
+            if improved:
                 self.best_val = val_mae
-                self.epochs_no_improve = 0
                 self.save_checkpoint(done_epochs, "checkpoint_best.pth")
                 best_path = os.path.abspath(os.path.join(self.exp_dir, "checkpoint_best.pth"))
                 logger.info("New best val MAE %.4f mmHg @ epoch %d -> %s", val_mae, done_epochs, best_path)
+            if significant:
+                self.epochs_no_improve = 0
             else:
                 self.epochs_no_improve += 1
-                logger.info("val MAE %.4f: no improvement for %d val round(s) (best %.4f)",
-                            val_mae, self.epochs_no_improve, self.best_val)
+                logger.info("val MAE %.4f: no improvement >=%.3g for %d val round(s) (best %.4f)",
+                            val_mae, min_delta, self.epochs_no_improve, self.best_val)
                 lr_pat = int(self.cfg.training.lr_patience)
                 if lr_pat > 0 and self.epochs_no_improve % lr_pat == 0:
                     self.lr_scale *= float(self.cfg.training.lr_decay)
