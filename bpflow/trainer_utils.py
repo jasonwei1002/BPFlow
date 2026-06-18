@@ -170,6 +170,11 @@ class TrainingConfig:
     # (no new timestamp), load its checkpoint_latest.pth, and continue the same
     # SwanLab run. Empty = off (fresh timestamped run). Set via --resume.
     resume_dir: str = ""
+    # Custom run name for a FRESH run: used as the exp_dir basename
+    # (output_dir/<run_name>) AND the SwanLab experiment_name (so the run is
+    # identifiable, e.g. by hyperparameters). Empty = auto timestamp + SwanLab
+    # auto-generated name. Ignored when resuming (resume_dir wins).
+    run_name: str = ""
     # After training finishes, evaluate on the CalFree test set (best-by-val EMA
     # weights), log test/* to SwanLab, and write test_metrics.json. DDP-sharded.
     run_test_after_train: bool = False

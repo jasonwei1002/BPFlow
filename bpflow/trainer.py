@@ -76,7 +76,9 @@ class Trainer:
             self.exp_dir = os.path.normpath(resume_dir)
             self.run_name = os.path.basename(self.exp_dir)
         else:
-            self.run_name = self._make_run_name()
+            # explicit run_name (config is shared → all ranks agree, no broadcast);
+            # else a rank-0-broadcast timestamp.
+            self.run_name = str(cfg.training.run_name) or self._make_run_name()
             self.exp_dir = os.path.join(str(cfg.training.output_dir), self.run_name)
         if is_main_process():
             os.makedirs(self.exp_dir, exist_ok=True)
@@ -234,12 +236,18 @@ class Trainer:
         resume_kwargs: dict = {}
         if self._resume_sw_id and mode in ("online", "cloud"):
             resume_kwargs = {"id": str(self._resume_sw_id), "resume": "allow"}
+        # Name the SwanLab run after the explicit run_name (e.g. probs-encoded) when
+        # set; otherwise let SwanLab auto-generate. Skip when resuming (keep the id).
+        name_kwargs: dict = {}
+        if str(self.cfg.training.run_name) and not resume_kwargs:
+            name_kwargs["experiment_name"] = self.run_name
         run = swanlab.init(
             project=str(self.cfg.training.swanlab_project),
             description="BPFlow ECG+PPG -> ABP flow matching",
             config=config,
             mode=mode,
             **resume_kwargs,
+            **name_kwargs,
         )
         self.sw = swanlab
         # Remember this run's id so checkpoints can point --resume back to it.
@@ -643,6 +651,17 @@ class Trainer:
             }
         return report
 
+    def _active_modalities(self) -> list:
+        """Trained directions in MODALITY_ORDER (specialist → its 1; unified → every
+        modality with prob>0). Pure cfg → identical on every rank, so it's safe to
+        drive the per-direction DDP-collective loops in validate()/_val_modality_losses."""
+        trained = trained_modalities(
+            str(self.cfg.data.cond_modality),
+            bool(self.cfg.data.modality_dropout),
+            self.cfg.data.modality_dropout_probs,
+        )
+        return [m for m in MODALITY_ORDER if m in trained]
+
     @torch.no_grad()
     def _val_modality_losses(self, max_batches: int) -> dict:
         """Per-modality flow-matching loss on the val split (ecg_ppg / ecg / ppg).
@@ -663,12 +682,7 @@ class Trainer:
         # only the directions the model trains on (specialist -> its 1 direction;
         # dropout -> every modality with prob>0), so a specialist doesn't pay 3x
         # for two uninformative directions. Same on every rank → DDP-safe size.
-        trained = trained_modalities(
-            str(self.cfg.data.cond_modality),
-            bool(self.cfg.data.modality_dropout),
-            self.cfg.data.modality_dropout_probs,
-        )
-        active = [m for m in MODALITY_ORDER if m in trained]
+        active = self._active_modalities()
         base_seed = int(self.cfg.training.seed)
         use_demo = bool(self.cfg.model.use_demo)
         was_training = self.model_raw.training
@@ -722,22 +736,18 @@ class Trainer:
         cond_mask. The returned/decision MAE is the MEAN across directions, so
         best-ckpt / plateau / early-stop optimise all served directions jointly (not
         just ecg_ppg). A specialist has one direction -> identical to the old
-        single-direction behaviour. Logged: per-direction MAE flat as
-        ``val/MAE_<modality>`` (mirrors ``val/loss_<modality>`` → the directions are
-        comparable in one chart), the full per-direction waveform + clinical report
-        grouped under ``val/<modality>/*``, and top-level ``val/MAE|RMSE|Pearson``
-        as the across-direction means.
+        single-direction behaviour. Logged: the full per-direction report as FLAT
+        keys ``val/<metric>_<modality>`` (e.g. ``val/MAE_<m>``, ``val/SBP_AAMI_pass_<m>``;
+        suffix style mirrors ``val/loss_<modality>`` → each metric's directions sit in
+        one chart, not nested ``val/<m>/*`` groups), and top-level
+        ``val/MAE|RMSE|Pearson`` as the across-direction means.
 
         ``val/*`` is logged with ``step=epoch``. Cost: the sampler runs |directions|
         times (3x for a unified model)."""
         if self.val_loader is None:
             return float("inf")
         # SAME order on every rank → the per-direction all_gather stays symmetric.
-        active = [m for m in MODALITY_ORDER if m in trained_modalities(
-            str(self.cfg.data.cond_modality),
-            bool(self.cfg.data.modality_dropout),
-            self.cfg.data.modality_dropout_probs,
-        )]
+        active = self._active_modalities()
         reports: dict = {}
         with self._ema_swapped(self.use_ema):
             for m in active:
@@ -751,14 +761,20 @@ class Trainer:
         # metric driving best/plateau/early-stop via the return value).
         metrics: dict = {}
         for m, rep in reports.items():
-            metrics.update(self._flat_report(rep, f"val/{m}"))  # full per-direction report (grouped)
-            metrics[f"val/MAE_{m}"] = float(rep["waveform"]["MAE"])  # flat (mirrors val/loss_<m>) → 3 dirs comparable in one chart
-        mean = lambda key: sum(float(r["waveform"][key]) for r in reports.values()) / len(reports)
-        metrics["val/MAE"], metrics["val/RMSE"], metrics["val/Pearson"] = mean("MAE"), mean("RMSE"), mean("Pearson")
+            # full per-direction report as FLAT keys: val/MAE_<m>, val/RMSE_<m>,
+            # val/SBP_AAMI_pass_<m>, ... (suffix style, mirrors val/loss_<m>) — NOT
+            # nested val/<m>/* groups, so each metric's 3 directions sit in one chart.
+            for k, v in self._flat_report(rep, "val").items():
+                metrics[f"{k}_{m}"] = v
+        def _mean(key: str) -> float:
+            return sum(float(r["waveform"][key]) for r in reports.values()) / len(reports)
+        metrics["val/MAE"], metrics["val/RMSE"], metrics["val/Pearson"] = _mean("MAE"), _mean("RMSE"), _mean("Pearson")
         for k, v in mod_losses.items():
             metrics[f"val/loss_{k}"] = v
         self._sw_log(metrics, epoch)
-        detail = "  ".join(f"{m}={float(reports[m]['waveform']['MAE']):.4f}" for m in active)
+        detail = "  ".join(f"{m}={metrics[f'val/MAE_{m}']:.4f}" for m in active)  # reuse the stored per-dir MAE
+        # CONTRACT: tune_modality_probs.py regex-parses "MAE mean=<float>" off this line
+        # for ASHA pruning — keep that token if you reword it, or pruning silently no-ops.
         logger.info("[val] MAE mean=%.4f mmHg over [%s]  (%s)", metrics["val/MAE"], ",".join(active), detail)
         if mod_losses:
             logger.info("[val] flow-matching loss  %s",
