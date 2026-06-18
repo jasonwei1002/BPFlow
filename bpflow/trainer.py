@@ -547,7 +547,7 @@ class Trainer:
             yield
 
     @torch.no_grad()
-    def _distributed_eval(self, loader, desc: str, max_batches: int = -1):
+    def _distributed_eval(self, loader, desc: str, max_batches: int = -1, cond_mask_override=None):
         """Sample this rank's loader shard, gather PER-SEGMENT quantities to rank 0,
         and assemble a full report there (None on other ranks).
 
@@ -557,6 +557,11 @@ class Trainer:
         Assumes model_raw is already in the desired param state (the caller does
         the EMA swap / best-weights load). ALL ranks must call this together — the
         all_gather is a collective; an early per-rank return would deadlock.
+
+        ``cond_mask_override`` (a ``(2,)`` [ecg_present, ppg_present] tensor) forces
+        the conditioning DIRECTION for every batch, ignoring the loader's per-sample
+        cond_mask — used by ``validate()`` to score each trained direction of a
+        unified model on the same segments. ``None`` = use the batch's cond_mask.
         """
         was_training = self.model_raw.training
         self.model_raw.eval()
@@ -569,8 +574,11 @@ class Trainer:
         for bi, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=not is_main_process())):
             if 0 < max_batches <= bi:
                 break
+            cm = batch.get("cond_mask")
+            if cond_mask_override is not None:  # force one direction for every batch
+                cm = cond_mask_override.view(1, 2).repeat(batch["cond_patches"].shape[0], 1)
             pred = self._sample_cond(
-                batch["cond_patches"], self._batch_demo(batch), batch.get("cond_mask")
+                batch["cond_patches"], self._batch_demo(batch), cm
             )  # (b, L) mmHg on CPU
             gt = batch["abp_raw"]
             pbp, tbp = segment_bp(pred), segment_bp(gt)
@@ -704,29 +712,58 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch: int) -> float:
-        """DDP-sharded validation; mean waveform MAE (mmHg) on rank 0 (inf
-        elsewhere). Uses the current in-memory EMA weights. Evaluates the whole
-        val_loader, which is already stride-subsampled to ``val_eval_fraction``.
+        """DDP-sharded validation; returns the decision MAE (mmHg) on rank 0 (inf
+        elsewhere). Uses the current in-memory EMA weights on the val_loader,
+        already stride-subsampled to ``val_eval_fraction``.
 
-        ``val/*`` metrics are logged to SwanLab with ``step=epoch`` (an epoch
-        x-axis, not the global train step) since validation is once-per-epoch."""
+        Scores EVERY trained direction (``trained_modalities``: specialist -> its 1
+        direction; unified/modality_dropout -> every modality with prob>0), running
+        the ODE sampler once per direction on the SAME val segments via a forced
+        cond_mask. The returned/decision MAE is the MEAN across directions, so
+        best-ckpt / plateau / early-stop optimise all served directions jointly (not
+        just ecg_ppg). A specialist has one direction -> identical to the old
+        single-direction behaviour. Logged: per-direction MAE flat as
+        ``val/MAE_<modality>`` (mirrors ``val/loss_<modality>`` → the directions are
+        comparable in one chart), the full per-direction waveform + clinical report
+        grouped under ``val/<modality>/*``, and top-level ``val/MAE|RMSE|Pearson``
+        as the across-direction means.
+
+        ``val/*`` is logged with ``step=epoch``. Cost: the sampler runs |directions|
+        times (3x for a unified model)."""
         if self.val_loader is None:
             return float("inf")
+        # SAME order on every rank → the per-direction all_gather stays symmetric.
+        active = [m for m in MODALITY_ORDER if m in trained_modalities(
+            str(self.cfg.data.cond_modality),
+            bool(self.cfg.data.modality_dropout),
+            self.cfg.data.modality_dropout_probs,
+        )]
+        reports: dict = {}
         with self._ema_swapped(self.use_ema):
-            report = self._distributed_eval(self.val_loader, "val", -1)
+            for m in active:
+                mask = torch.tensor(MODALITY_MASK[m], dtype=torch.float32)
+                reports[m] = self._distributed_eval(self.val_loader, f"val:{m}", -1, cond_mask_override=mask)
             # all ranks must enter (all_reduce inside) — before the rank-0 return
             mod_losses = self._val_modality_losses(int(self.cfg.training.val_loss_max_batches))
-        if report is None or not is_main_process():
+        if not is_main_process() or not reports or any(r is None for r in reports.values()):
             return float("inf")
-        logger.info("[val] %s", format_report(report).replace("\n", " | "))
-        metrics = self._flat_report(report, "val")
+        # per-direction detail + across-direction mean (the mean MAE is the decision
+        # metric driving best/plateau/early-stop via the return value).
+        metrics: dict = {}
+        for m, rep in reports.items():
+            metrics.update(self._flat_report(rep, f"val/{m}"))  # full per-direction report (grouped)
+            metrics[f"val/MAE_{m}"] = float(rep["waveform"]["MAE"])  # flat (mirrors val/loss_<m>) → 3 dirs comparable in one chart
+        mean = lambda key: sum(float(r["waveform"][key]) for r in reports.values()) / len(reports)
+        metrics["val/MAE"], metrics["val/RMSE"], metrics["val/Pearson"] = mean("MAE"), mean("RMSE"), mean("Pearson")
         for k, v in mod_losses.items():
             metrics[f"val/loss_{k}"] = v
         self._sw_log(metrics, epoch)
+        detail = "  ".join(f"{m}={float(reports[m]['waveform']['MAE']):.4f}" for m in active)
+        logger.info("[val] MAE mean=%.4f mmHg over [%s]  (%s)", metrics["val/MAE"], ",".join(active), detail)
         if mod_losses:
             logger.info("[val] flow-matching loss  %s",
                         "  ".join(f"{k}={v:.4f}" for k, v in mod_losses.items()))
-        return float(report["waveform"]["MAE"])
+        return float(metrics["val/MAE"])
 
     # -- final test --------------------------------------------------------
     def _maybe_run_test(self, epoch: int) -> None:
