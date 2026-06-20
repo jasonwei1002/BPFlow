@@ -25,6 +25,7 @@ from ._wavflow_layers import (
     TimestepEmbedder,
     compute_rope_rotations,
 )
+from .attention_mask import build_task_mask
 from .blocks import BPJointBlock
 
 log = logging.getLogger(__name__)
@@ -39,11 +40,19 @@ DemoInput = Tuple[torch.Tensor, torch.Tensor]
 
 @dataclass
 class BPConditions:
-    """Cached condition tensors that do not depend on the latent or timestep."""
+    """Per-task condition tensors that are constant across ODE steps.
 
-    ecg_seq: torch.Tensor  # (B, N, hidden)
-    ppg_seq: torch.Tensor  # (B, N, hidden)
-    pooled: torch.Tensor  # (B, hidden)
+    For the symmetric multi-target setup, the only thing that changes across ODE
+    steps is the noised TARGET; everything here (the clean-condition / absent
+    contribution per stream, the global pooled vector, the task attention mask,
+    the per-sample target index + role one-hot) is precomputed once.
+    """
+
+    stream_base: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]  # cond+absent part per stream
+    is_target: torch.Tensor  # (B, 3) one-hot float: which stream is the noised target
+    target_idx: torch.Tensor  # (B,) long
+    pooled: torch.Tensor  # (B, hidden) global condition (present conditions only)
+    attn_mask: torch.Tensor  # (B, 1, 3N, 3N) additive task-routing mask
     demo_emb: Optional[torch.Tensor] = None  # (B, hidden) global demo prior, or None
 
 
@@ -113,22 +122,38 @@ class BPFlowModel(nn.Module):
         self.cond_dim = 2 * patch_size  # condition delivered as (B,N,2P) then split
         self.latent_seq_len = seq_len // patch_size
 
-        # Per-stream patch embedders (ECG and PPG each get their own).
-        self.abp_input_proj = _patch_embedder(self.latent_dim, hidden_dim, mlp_kernel=7)
-        self.ecg_input_proj = _patch_embedder(patch_size, hidden_dim, mlp_kernel=3)
-        self.ppg_input_proj = _patch_embedder(patch_size, hidden_dim, mlp_kernel=3)
-        # Learned "modality absent" tokens: when cond_mask marks a stream absent,
-        # its per-token embedding is replaced by this vector (instead of zeroing
-        # the input), giving the model a dedicated, unambiguous "missing" code.
-        self.null_ecg = nn.Parameter(torch.zeros(hidden_dim))
-        self.null_ppg = nn.Parameter(torch.zeros(hidden_dim))
+        # Symmetric multi-target embedders (stream order 0=ABP, 1=ECG, 2=PPG).
+        # A stream can be the noised TARGET (embedded by noised_in[s]) or a clean
+        # CONDITION (cond_in); an absent stream is filled with a learned
+        # absent_token[s] and masked out of attention. ABP is never a condition in
+        # the task set -> it has no cond_in.
+        self.noised_in = nn.ModuleList(
+            [
+                _patch_embedder(patch_size, hidden_dim, mlp_kernel=7),  # ABP target
+                _patch_embedder(patch_size, hidden_dim, mlp_kernel=3),  # ECG target
+                _patch_embedder(patch_size, hidden_dim, mlp_kernel=3),  # PPG target
+            ]
+        )
+        self.cond_in = nn.ModuleDict(
+            {
+                "ecg": _patch_embedder(patch_size, hidden_dim, mlp_kernel=3),
+                "ppg": _patch_embedder(patch_size, hidden_dim, mlp_kernel=3),
+            }
+        )
+        # learned per-stream "absent" fillers; referenced (zero-gated) every forward
+        # via the role one-hot, so DDP find_unused_parameters=False stays valid.
+        self.absent_token = nn.ParameterList(
+            [nn.Parameter(torch.zeros(hidden_dim)) for _ in range(3)]
+        )
         self.global_cond_mlp = MLP(hidden_dim, hidden_dim * 4)
         self.t_embed = TimestepEmbedder(hidden_dim, frequency_embedding_size=256, max_period=10000)
 
+        # pre_only=False on every joint block: the per-sample target varies across a
+        # batch, so all three streams must stay updated through every joint layer.
         self.joint_blocks = nn.ModuleList(
             [
-                BPJointBlock(hidden_dim, num_heads, mlp_ratio, pre_only=(i == joint_depth - 1))
-                for i in range(joint_depth)
+                BPJointBlock(hidden_dim, num_heads, mlp_ratio, pre_only=False)
+                for _ in range(joint_depth)
             ]
         )
         self.fused_blocks = nn.ModuleList(
@@ -139,7 +164,8 @@ class BPFlowModel(nn.Module):
                 for _ in range(depth - joint_depth)
             ]
         )
-        self.final_layer = FinalBlock(hidden_dim, self.latent_dim)
+        # per-modality flow-decode heads (the gathered target stream -> its flow).
+        self.heads = nn.ModuleList([FinalBlock(hidden_dim, self.latent_dim) for _ in range(3)])
         # optional demographic global-condition encoder (zero-init -> no-op start)
         self.use_demo = use_demo
         if use_demo:
@@ -159,9 +185,9 @@ class BPFlowModel(nn.Module):
         self.apply(_basic_init)
         nn.init.normal_(self.t_embed.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embed.mlp[2].weight, std=0.02)
-        # distinct, small "modality absent" tokens (not zero → a real code)
-        nn.init.normal_(self.null_ecg, std=0.02)
-        nn.init.normal_(self.null_ppg, std=0.02)
+        # distinct, small per-stream "absent" fillers (not zero → a real code)
+        for tok in self.absent_token:
+            nn.init.normal_(tok, std=0.02)
 
         def _zero_adaln(blk: MMDitSingleBlock) -> None:
             nn.init.constant_(blk.adaLN_modulation[-1].weight, 0)
@@ -173,39 +199,16 @@ class BPFlowModel(nn.Module):
             _zero_adaln(jb.ppg_block)
         for fb in self.fused_blocks:
             _zero_adaln(fb)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.conv.weight, 0)
-        nn.init.constant_(self.final_layer.conv.bias, 0)
+        # zero-init every decode head so the model starts as a no-op (flow ≈ 0).
+        for head in self.heads:
+            nn.init.constant_(head.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(head.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(head.conv.weight, 0)
+            nn.init.constant_(head.conv.bias, 0)
         if self.use_demo:
             # zero-init the encoder output so demographics start as a no-op
             nn.init.constant_(self.demo_encoder.mlp[-1].weight, 0)
             nn.init.constant_(self.demo_encoder.mlp[-1].bias, 0)
-
-    def _apply_null(
-        self,
-        ecg_seq: torch.Tensor,
-        ppg_seq: torch.Tensor,
-        cond_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Replace a masked stream's embedding with its learned null token.
-
-        ``cond_mask`` is (B, 2) in {0, 1} = [ecg_present, ppg_present]; ``None``
-        means all present (inference fast path) → return unchanged. When a mask
-        IS given (always during training), the null tokens are referenced even for
-        a present stream (zero coefficient), so they stay in the autograd graph and
-        DDP ``find_unused_parameters=False`` remains valid — training never passes
-        ``None``, so the early return only skips no-op work at inference.
-        """
-        if cond_mask is None:
-            return ecg_seq, ppg_seq
-        b = ecg_seq.shape[0]
-        cm = cond_mask.to(ecg_seq.device, ecg_seq.dtype)
-        e = cm[:, 0].view(b, 1, 1)
-        p = cm[:, 1].view(b, 1, 1)
-        ecg_seq = e * ecg_seq + (1.0 - e) * self.null_ecg.view(1, 1, -1)
-        ppg_seq = p * ppg_seq + (1.0 - p) * self.null_ppg.view(1, 1, -1)
-        return ecg_seq, ppg_seq
 
     def _demo_emb(self, demo: Optional[DemoInput]) -> Optional[torch.Tensor]:
         """Encode a demographics sample, or None when demo conditioning is off."""
@@ -216,45 +219,96 @@ class BPFlowModel(nn.Module):
 
     def preprocess_conditions(
         self,
-        cond_patches: torch.Tensor,
+        ecg_clean: torch.Tensor,
+        ppg_clean: torch.Tensor,
+        target_idx: torch.Tensor,
+        cond_present: torch.Tensor,
         demo: Optional[DemoInput] = None,
-        cond_mask: Optional[torch.Tensor] = None,
     ) -> BPConditions:
-        # cond_patches (B,N,2P) is channel-major [ECG(P), PPG(P)] -> split, embed,
-        # null-replace any masked stream, then pool for the global condition.
-        p = self.patch_size
-        ecg_seq = self.ecg_input_proj(cond_patches[..., :p])  # (B, N, H)
-        ppg_seq = self.ppg_input_proj(cond_patches[..., p:])  # (B, N, H)
-        ecg_seq, ppg_seq = self._apply_null(ecg_seq, ppg_seq, cond_mask)
-        pooled = self.global_cond_mlp((ecg_seq + ppg_seq).mean(dim=1))  # (B, H)
-        conds = BPConditions(ecg_seq=ecg_seq, ppg_seq=ppg_seq, pooled=pooled)
-        conds.demo_emb = self._demo_emb(demo)
-        return conds
+        """Precompute the per-task pieces constant across ODE steps.
+
+        ``ecg_clean`` / ``ppg_clean`` (B, N, P) are the recentered clean condition
+        patches (always passed; gated to 0 when that modality is the target/absent,
+        so a clean target never leaks). ``target_idx`` (B,) in {0,1,2}, and
+        ``cond_present`` (B, 3) marks which streams condition the model.
+        """
+        b = ecg_clean.shape[0]
+        dev, dt = ecg_clean.device, ecg_clean.dtype
+        sidx = torch.arange(3, device=dev).view(1, 3)
+        target_idx = target_idx.to(dev).long()
+        is_target = (sidx == target_idx.view(b, 1)).to(dt)  # (B, 3)
+        cp = cond_present.to(dev, dt)
+        is_cond = cp * (1.0 - is_target)  # present AND not the target -> condition
+        is_absent = (1.0 - is_target) * (1.0 - cp)  # neither target nor condition
+        # condition embeddings (ECG / PPG only; ABP is never a condition)
+        ecg_c = self.cond_in["ecg"](ecg_clean)  # (B, N, H)
+        ppg_c = self.cond_in["ppg"](ppg_clean)  # (B, N, H)
+
+        def base(s: int, cond_emb: Optional[torch.Tensor]) -> torch.Tensor:
+            out = is_absent[:, s].view(b, 1, 1) * self.absent_token[s].view(1, 1, -1)
+            if cond_emb is not None:
+                out = out + is_cond[:, s].view(b, 1, 1) * cond_emb
+            return out  # (B, 1or N, H), broadcasts over tokens when added to noised
+
+        stream_base = (base(0, None), base(1, ecg_c), base(2, ppg_c))
+        # global condition pooled over present conditions only (>=1 by construction)
+        cond_sum = is_cond[:, 1].view(b, 1) * ecg_c.mean(dim=1) + is_cond[:, 2].view(b, 1) * ppg_c.mean(dim=1)
+        num_cond = is_cond[:, 1:].sum(dim=1, keepdim=True).clamp(min=1.0)
+        pooled = self.global_cond_mlp(cond_sum / num_cond)
+        attn_mask = build_task_mask(target_idx, cp, self.latent_seq_len, dtype=dt, device=dev)
+        return BPConditions(
+            stream_base=stream_base,
+            is_target=is_target,
+            target_idx=target_idx,
+            pooled=pooled,
+            attn_mask=attn_mask,
+            demo_emb=self._demo_emb(demo),
+        )
 
     def predict_flow(
-        self, latent_patches: torch.Tensor, t: torch.Tensor, conditions: BPConditions
+        self, noised_target: torch.Tensor, t: torch.Tensor, conditions: BPConditions
     ) -> torch.Tensor:
-        latent = self.abp_input_proj(latent_patches)  # (B, N, H)
+        b = noised_target.shape[0]
+        it = conditions.is_target
+        # 3 stream embeddings = cached (cond/absent) base + this-step's noised-target
+        # embedding, gated by the role one-hot. noised_in[s] is applied for every s
+        # (gated) so all embedders stay in the autograd graph (DDP FUP=False).
+        streams = [
+            conditions.stream_base[s] + it[:, s].view(b, 1, 1) * self.noised_in[s](noised_target)
+            for s in range(3)
+        ]
+        latent, ecg, ppg = streams
         global_c = self.t_embed(t).unsqueeze(1) + conditions.pooled.unsqueeze(1)  # (B,1,H)
         if conditions.demo_emb is not None:
             global_c = global_c + conditions.demo_emb.unsqueeze(1)
-        ecg, ppg = conditions.ecg_seq, conditions.ppg_seq
         for block in self.joint_blocks:
-            latent, ecg, ppg = block(latent, ecg, ppg, global_c, self.latent_rot)
+            latent, ecg, ppg = block(latent, ecg, ppg, global_c, self.latent_rot, conditions.attn_mask)
+        # gather the per-sample target stream, refine, decode with its head
+        stacked = torch.stack([latent, ecg, ppg], dim=1)  # (B, 3, N, H)
+        n, h = stacked.shape[2], stacked.shape[3]
+        gi = conditions.target_idx.view(b, 1, 1, 1)
+        tgt = stacked.gather(1, gi.expand(b, 1, n, h)).squeeze(1)  # (B, N, H)
         for block in self.fused_blocks:
-            latent = block(latent, global_c, self.latent_rot)
-        return self.final_layer(latent, global_c)  # (B, N, P)
+            tgt = block(tgt, global_c, self.latent_rot)
+        # apply every head (keeps all in the graph), then gather the target's output
+        outs = torch.stack([head(tgt, global_c) for head in self.heads], dim=1)  # (B,3,N,P)
+        p = outs.shape[3]
+        return outs.gather(1, gi.expand(b, 1, n, p)).squeeze(1)  # (B, N, P)
 
     def forward(
         self,
-        latent_patches: torch.Tensor,
-        cond_patches: torch.Tensor,
+        noised_target: torch.Tensor,
+        ecg_clean: torch.Tensor,
+        ppg_clean: torch.Tensor,
         t: torch.Tensor,
+        target_idx: torch.Tensor,
+        cond_present: torch.Tensor,
         demo: Optional[DemoInput] = None,
-        cond_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.predict_flow(
-            latent_patches, t, self.preprocess_conditions(cond_patches, demo, cond_mask)
+            noised_target,
+            t,
+            self.preprocess_conditions(ecg_clean, ppg_clean, target_idx, cond_present, demo),
         )
 
     def ode_wrapper(

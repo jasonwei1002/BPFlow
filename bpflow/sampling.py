@@ -34,50 +34,71 @@ def _demo_to(demo, device: torch.device):
     return cont.to(device), gender.to(device)
 
 
+def _select_target(abp_patches, ecg_patches, ppg_patches, target_idx):
+    """Gather each sample's TARGET-modality clean patches (B, N, P) by target_idx
+    (0=ABP, 1=ECG, 2=PPG) from the three per-modality patch tensors."""
+    b, n, p = abp_patches.shape
+    allp = torch.stack([abp_patches, ecg_patches, ppg_patches], dim=1)  # (B,3,N,P)
+    gi = target_idx.view(b, 1, 1, 1).expand(b, 1, n, p)
+    return allp.gather(1, gi).squeeze(1)
+
+
 @torch.no_grad()
-def sample_abp(
+def sample_target(
     model: torch.nn.Module,
     fm: FlowMatching,
-    cond_patches: torch.Tensor,
+    ecg_patches: torch.Tensor,
+    ppg_patches: torch.Tensor,
+    target_idx: torch.Tensor,
+    cond_present: torch.Tensor,
     *,
     generator: torch.Generator,
     device: torch.device,
     abp_mean: float,
     abp_std: float,
+    cond_recenter: bool = True,
     autocast_ctx=None,
     demo=None,
-    cond_mask=None,
 ) -> torch.Tensor:
-    """Sample ABP waveforms (mmHg, shape (B, L)) from ECG+PPG condition patches.
+    """Sample the TARGET waveform (shape (B, L)) for each sample's task.
 
-    Assumes ``model`` is the raw (unwrapped) model already in the desired
-    eval/param state. ``demo`` is an optional (cont, gender) demographics sample
-    used as a global prior. ``cond_mask`` (B, 2) selects which modalities
-    condition the model (the rest are nulled); None = all present.
+    ``model`` is the raw (unwrapped) model in the desired eval/param state.
+    ``target_idx`` (B,) and ``cond_present`` (B, 3) define the task; ECG/PPG clean
+    condition patches are always passed (gated inside the model). Output is
+    de-normalized per the target modality: ABP -> mmHg (z-score inverse), ECG/PPG
+    -> undo the -0.5 recenter. Handles a mixed-target batch, though eval/infer
+    force a single direction.
     """
-    cond_patches = cond_patches.to(device)
+    ecg_patches = ecg_patches.to(device)
+    ppg_patches = ppg_patches.to(device)
+    target_idx = target_idx.to(device).long()
+    cond_present = cond_present.to(device)
     demo = _demo_to(demo, device)
-    cond_mask = cond_mask.to(device) if cond_mask is not None else None
-    bs = cond_patches.shape[0]
-    conditions = model.preprocess_conditions(cond_patches, demo, cond_mask)
+    bs = ecg_patches.shape[0]
+    conditions = model.preprocess_conditions(ecg_patches, ppg_patches, target_idx, cond_present, demo)
     x0 = (
-        torch.randn(
-            bs, model.latent_seq_len, model.latent_dim, generator=generator, device=device
-        )
+        torch.randn(bs, model.latent_seq_len, model.latent_dim, generator=generator, device=device)
         * fm.noise_scale
     )
     fn = lambda t, x: model.ode_wrapper(t, x, conditions)
     with (autocast_ctx if autocast_ctx is not None else nullcontext()):
         x1 = fm.to_data(fn, x0)
-    wave = unpatchify(x1).float().cpu()
-    return destandardize_abp(wave, abp_mean, abp_std)
+    wave = unpatchify(x1).float().cpu()  # (B, L) in normalized space
+    ti = target_idx.cpu()
+    abp_wave = destandardize_abp(wave, abp_mean, abp_std)
+    other_wave = wave + 0.5 if cond_recenter else wave  # ECG/PPG recenter inverse
+    is_abp = (ti == 0).view(-1, 1)
+    return torch.where(is_abp, abp_wave, other_wave)
 
 
 def flow_matching_loss(
     model: torch.nn.Module,
     fm: FlowMatching,
     abp_patches: torch.Tensor,
-    cond_patches: torch.Tensor,
+    ecg_patches: torch.Tensor,
+    ppg_patches: torch.Tensor,
+    target_idx: torch.Tensor,
+    cond_present: torch.Tensor,
     *,
     generator: torch.Generator,
     logit_mean: float,
@@ -85,21 +106,19 @@ def flow_matching_loss(
     prediction_type: str,
     loss_type: str,
     demo=None,
-    cond_mask=None,
     per_sample: bool = False,
 ) -> torch.Tensor:
-    """One flow-matching training step: noise -> predict -> loss.
+    """One flow-matching training step for a per-sample TARGET: select target ->
+    noise -> predict -> loss.
 
-    ``model`` is called for the forward, so pass the DDP-wrapped module when
-    training under DDP (gradient sync) and the raw module otherwise. ``demo`` is
-    an optional (cont, gender) demographics sample (already on the right device).
-    ``cond_mask`` (B, 2) selects the conditioning modalities (rest nulled).
-    Returns the mean scalar; with ``per_sample=True`` returns the per-sample
-    ``(B,)`` loss instead (``fm.loss`` already reduces over all but the batch
-    dim) — used to decompose the train loss by modality without an extra forward.
+    ``model`` is called for the forward, so pass the DDP-wrapped module under DDP.
+    ``target_idx`` (B,) picks each sample's target modality; ``cond_present`` (B, 3)
+    its conditions. Returns the mean scalar; ``per_sample=True`` returns the (B,)
+    per-sample loss (to decompose train loss by task without an extra forward).
     """
-    t = log_normal_sample(abp_patches, generator=generator, m=logit_mean, s=logit_scale)
-    x0, x1, xt, t_sh = fm.get_x0_xt_c(abp_patches, t, generator=generator)
-    pred = model(xt, cond_patches, t_sh, demo, cond_mask)
+    target_patches = _select_target(abp_patches, ecg_patches, ppg_patches, target_idx)
+    t = log_normal_sample(target_patches, generator=generator, m=logit_mean, s=logit_scale)
+    x0, x1, xt, t_sh = fm.get_x0_xt_c(target_patches, t, generator=generator)
+    pred = model(xt, ecg_patches, ppg_patches, t_sh, target_idx, cond_present, demo)
     per = fm.loss(prediction_type, loss_type, pred, x0, xt, x1, t_sh)  # (B,)
     return per if per_sample else per.mean()

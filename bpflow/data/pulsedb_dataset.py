@@ -26,7 +26,6 @@ import torch
 from torch.utils.data import Dataset
 
 from .transforms import (
-    build_cond_patches,
     patchify,
     standardize_abp,
     standardize_demo,
@@ -36,40 +35,55 @@ log = logging.getLogger(__name__)
 
 _DEMO_COLS = ["age", "gender", "height", "weight", "bmi"]
 _BP_COLS = ["sbp", "dbp", "map"]  # CSV cuff label -> optional clinical TRUE for eval
-MODALITY_ORDER = ("ecg_ppg", "ecg", "ppg")  # order of modality_dropout_probs
-# cond_mask = [ecg_present, ppg_present]; the model nulls the absent stream(s).
-MODALITY_MASK = {"ecg_ppg": (1.0, 1.0), "ecg": (1.0, 0.0), "ppg": (0.0, 1.0)}
-# single source of truth for the default per-sample dropout probs (~uniform,
-# order = MODALITY_ORDER); referenced by the config schema + dataset/infer fallbacks.
-DEFAULT_MODALITY_DROPOUT_PROBS = (0.34, 0.33, 0.33)
+# Multi-target task system. Stream / target index order: 0=ABP, 1=ECG, 2=PPG.
+TARGET_ORDER = ("abp", "ecg", "ppg")
+# task name -> (target_idx, cond_present over [abp, ecg, ppg]). A target is never
+# its own condition; ABP is never a condition in this task set.
+# Task names use "2" for "->" (e.g. ppg2abp = "PPG -> ABP") so they are clean
+# identifiers everywhere: YAML lists, SwanLab metric keys, filenames.
+TASK_SPEC = {
+    "ecg_ppg2abp": (0, (0.0, 1.0, 1.0)),
+    "ecg2abp": (0, (0.0, 1.0, 0.0)),
+    "ppg2abp": (0, (0.0, 0.0, 1.0)),
+    "ppg2ecg": (1, (0.0, 0.0, 1.0)),
+    "ecg2ppg": (2, (0.0, 1.0, 0.0)),
+}
+TASK_ORDER = ("ecg_ppg2abp", "ecg2abp", "ppg2abp", "ppg2ecg", "ecg2ppg")
+# the directions whose ABP recon drives best-checkpoint / early-stop selection.
+ABP_TASKS = ("ecg_ppg2abp", "ecg2abp", "ppg2abp")
+# suggested per-sample task probs (->ABP-heavy; order = TASK_ORDER). Configs that
+# train all five tasks use this; the code default is uniform over the task list.
+DEFAULT_TASK_PROBS = (0.30, 0.20, 0.20, 0.15, 0.15)
 
 
-def trained_modalities(
-    cond_modality: str,
-    modality_dropout: bool,
-    modality_dropout_probs: Optional[list] = None,
-) -> set:
-    """The set of conditioning directions a model was actually trained on.
+def resolve_tasks(tasks: Optional[list], task_probs: Optional[list]):
+    """Validate (tasks, task_probs) -> (task_names tuple, probs list).
 
-    ``modality_dropout`` True  -> every modality with prob > 0 (the unified case;
-    degenerate probs like [1,0,0] collapse to one direction). False -> just the
-    fixed ``{cond_modality}`` (specialist). Shared by the infer guard (which side
-    of the checkpoint is valid to evaluate) and the trainer's per-modality val
-    loss (which directions are worth logging).
+    ``tasks`` is a subset of TASK_SPEC names (None/empty -> all TASK_ORDER);
+    ``task_probs`` is aligned to it (None -> uniform). Probs must be non-negative
+    and sum > 0.
     """
-    if modality_dropout:
-        probs = (
-            list(modality_dropout_probs)
-            if modality_dropout_probs
-            else list(DEFAULT_MODALITY_DROPOUT_PROBS)
-        )
-        if len(probs) != len(MODALITY_ORDER):
+    names = tuple(tasks) if tasks else TASK_ORDER
+    for t in names:
+        if t not in TASK_SPEC:
+            raise ValueError(f"unknown task {t!r}; valid: {list(TASK_SPEC)}")
+    if task_probs:
+        probs = [float(p) for p in task_probs]
+        if len(probs) != len(names) or any(p < 0 for p in probs) or sum(probs) <= 0:
             raise ValueError(
-                f"modality_dropout_probs must have {len(MODALITY_ORDER)} entries "
-                f"(order {MODALITY_ORDER}), got {len(probs)}"
+                f"task_probs must have {len(names)} non-negative values (order {names}) "
+                f"summing > 0, got {probs}"
             )
-        return {m for m, p in zip(MODALITY_ORDER, probs) if float(p) > 0}
-    return {str(cond_modality)}
+    else:
+        probs = [1.0 / len(names)] * len(names)
+    return names, probs
+
+
+def trained_tasks(tasks: Optional[list], task_probs: Optional[list] = None) -> set:
+    """The set of tasks a model was actually trained on (prob > 0). Shared by the
+    trainer (which directions to validate / log) and infer (which are valid)."""
+    names, probs = resolve_tasks(tasks, task_probs)
+    return {t for t, p in zip(names, probs) if p > 0}
 
 
 def _csv_path_for(npy_path: str) -> str:
@@ -105,9 +119,9 @@ class PulseDBDataset(Dataset):
         abp_clip_low: float = 20.0,
         abp_clip_high: float = 250.0,
         cond_recenter: bool = True,
-        cond_modality: str = "ecg_ppg",
-        modality_dropout: bool = False,
-        modality_dropout_probs: Optional[list] = None,
+        tasks: Optional[list] = None,
+        task_probs: Optional[list] = None,
+        eval_task: Optional[str] = None,
         use_demo: bool = False,
         demo_consts: Optional[Dict[str, float]] = None,
         eval_true_source: str = "waveform",
@@ -122,8 +136,6 @@ class PulseDBDataset(Dataset):
             raise ValueError(f"split must be train/val/test, got {split}")
         if split_mode not in ("segment", "subject"):
             raise ValueError(f"split_mode must be segment/subject, got {split_mode}")
-        if cond_modality not in ("ecg", "ppg", "ecg_ppg"):
-            raise ValueError(f"cond_modality must be ecg/ppg/ecg_ppg, got {cond_modality}")
         if not 0.0 < finetune_train_ratio <= 1.0:
             raise ValueError(f"finetune_train_ratio must be in (0, 1], got {finetune_train_ratio}")
         if finetune_split_mode not in ("segment", "stratified"):
@@ -180,23 +192,19 @@ class PulseDBDataset(Dataset):
         self.abp_clip_low = abp_clip_low
         self.abp_clip_high = abp_clip_high
         self.cond_recenter = cond_recenter
-        self.cond_modality = cond_modality
-        # Per-sample modality dropout is a TRAIN-only augmentation; val/test keep
-        # the fixed cond_modality so their metrics stay comparable.
-        self._dropout_active = bool(modality_dropout) and split == "train"
-        self._dropout_probs = None
-        if self._dropout_active:
-            probs = (
-                list(modality_dropout_probs)
-                if modality_dropout_probs
-                else list(DEFAULT_MODALITY_DROPOUT_PROBS)
-            )
-            if len(probs) != len(MODALITY_ORDER) or any(p < 0 for p in probs) or sum(probs) <= 0:
-                raise ValueError(
-                    f"modality_dropout_probs must be {len(MODALITY_ORDER)} non-negative "
-                    f"values (order {MODALITY_ORDER}) summing > 0, got {probs}"
-                )
-            self._dropout_probs = torch.tensor(probs, dtype=torch.float32)
+        # Per-sample task draw is TRAIN-only; val/test/infer use a single fixed
+        # eval_task (default: the first ->ABP task in the set) so metrics stay
+        # comparable. The trainer overrides the task per direction during eval.
+        self._task_names, probs = resolve_tasks(tasks, task_probs)
+        self._task_probs = torch.tensor(probs, dtype=torch.float32)
+        self._train_draw = split == "train"
+        if eval_task is not None:
+            if eval_task not in TASK_SPEC:
+                raise ValueError(f"unknown eval_task {eval_task!r}; valid: {list(TASK_SPEC)}")
+            self.eval_task = eval_task
+        else:
+            abp_in = [t for t in self._task_names if t in ABP_TASKS]
+            self.eval_task = abp_in[0] if abp_in else self._task_names[0]
         self.use_demo = use_demo
 
         self.demo_cont = None
@@ -375,22 +383,30 @@ class PulseDBDataset(Dataset):
         abp_norm = standardize_abp(
             abp, self.abp_mean, self.abp_std, self.abp_clip_low, self.abp_clip_high
         )
+        # clean patches in each modality's own space: ABP z-scored, ECG/PPG recentered.
+        # Whichever is the task TARGET is noised downstream by the flow-matching step;
+        # the others (if present) condition the model. ECG/PPG always emitted; gating
+        # in the model ensures a clean target never leaks (see networks.preprocess).
+        ecg_sig = ecg - 0.5 if self.cond_recenter else ecg
+        ppg_sig = ppg - 0.5 if self.cond_recenter else ppg
         abp_patches = patchify(abp_norm, self.patch_size)  # (N, P)
-        cond_patches = build_cond_patches(ecg, ppg, self.patch_size, self.cond_recenter)  # (N, 2P)
-        # TRAIN-only: draw this sample's modality (torch RNG → DataLoader seeds it
-        # per worker). Otherwise use the fixed cond_modality (val/test/infer). The
-        # choice becomes a cond_mask; the model nulls the absent stream(s).
-        if self._dropout_active:
-            assert self._dropout_probs is not None
-            modality = MODALITY_ORDER[int(torch.multinomial(self._dropout_probs, 1).item())]
+        ecg_patches = patchify(ecg_sig, self.patch_size)   # (N, P)
+        ppg_patches = patchify(ppg_sig, self.patch_size)   # (N, P)
+        # TRAIN-only: draw this sample's task (torch RNG → DataLoader seeds it per
+        # worker). val/test/infer use the fixed eval_task; the trainer overrides it
+        # per direction during eval.
+        if self._train_draw:
+            task = self._task_names[int(torch.multinomial(self._task_probs, 1).item())]
         else:
-            modality = self.cond_modality
-        cond_mask = torch.tensor(MODALITY_MASK[modality], dtype=torch.float32)  # (2,) [ecg, ppg]
+            task = self.eval_task
+        target_idx, cond_present = TASK_SPEC[task]
 
         out = {
             "abp_patches": abp_patches,
-            "cond_patches": cond_patches,
-            "cond_mask": cond_mask,  # (2,) [ecg_present, ppg_present] -> model nulls absent
+            "ecg_patches": ecg_patches,
+            "ppg_patches": ppg_patches,
+            "target_idx": torch.tensor(target_idx, dtype=torch.long),
+            "cond_present": torch.tensor(cond_present, dtype=torch.float32),  # (3,) [abp,ecg,ppg]
             "abp_raw": abp,  # ground-truth mmHg waveform for eval (unclipped)
         }
         if self.bp_true is not None:
@@ -432,11 +448,9 @@ def build_dataset(cfg, split: str) -> PulseDBDataset:
         abp_clip_low=float(d.abp_clip_low),
         abp_clip_high=float(d.abp_clip_high),
         cond_recenter=bool(d.cond_recenter),
-        cond_modality=str(getattr(d, "cond_modality", "ecg_ppg")),
-        modality_dropout=bool(getattr(d, "modality_dropout", False)),
-        modality_dropout_probs=(
-            list(d.modality_dropout_probs) if getattr(d, "modality_dropout_probs", None) else None
-        ),
+        tasks=(list(d.tasks) if getattr(d, "tasks", None) else None),
+        task_probs=(list(d.task_probs) if getattr(d, "task_probs", None) else None),
+        eval_task=(str(d.eval_task) if getattr(d, "eval_task", None) else None),
         use_demo=bool(cfg.model.use_demo),
         demo_consts=demo_consts,
         eval_true_source=str(getattr(d, "eval_true_source", "waveform")),

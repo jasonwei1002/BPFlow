@@ -13,12 +13,12 @@ model:
   mlp_ratio: 2.0
 
 data:
-  # Smoke is a deterministic pipeline gate, so pin the specialist path (override
-  # base.yaml's unified default): the tiny CPU model overfits the full-information
-  # ecg_ppg direction. A random per-sample mask would assign some of the 8 overfit
-  # segments to single-channel (ecg/ppg) reconstruction, which is harder and makes
-  # the fixed recon threshold flaky. Real training/finetune stay unified.
-  modality_dropout: false
+  # Smoke verifies the MULTI-TARGET pipeline: smoke_test.py overfits a tiny fixed
+  # set with deterministic per-sample tasks (ecg_ppg2abp and ppg2ecg), proving a
+  # target≠ABP trains while keeping the recon threshold stable. The tasks list here
+  # is only what build_dataset would draw; smoke_test overrides it per sample.
+  tasks: [ecg_ppg2abp, ppg2ecg]
+  task_probs: [0.5, 0.5]
 
 sampling:
   num_steps: 5

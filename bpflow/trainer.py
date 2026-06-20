@@ -19,11 +19,11 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from .data import MODALITY_MASK, MODALITY_ORDER, build_dataset, trained_modalities
+from .data import ABP_TASKS, TASK_ORDER, TASK_SPEC, build_dataset, trained_tasks, unpatchify
 from .eval import aami, bhs, format_report, segment_bp
 from .eval.metrics import _pearson
 from .model import build_model
-from .sampling import build_flow_matching, flow_matching_loss, sample_abp
+from .sampling import build_flow_matching, flow_matching_loss, sample_target
 from .trainer_utils import (
     add_weight_decay,
     adjust_learning_rate,
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def _seed_worker(worker_id: int, base_seed: int = 0) -> None:
-    """Seed a DataLoader worker's torch RNG from the run seed so modality_dropout
+    """Seed a DataLoader worker's torch RNG from the run seed so per-sample task
     draws are tied to cfg.training.seed (reproducible at a fixed num_workers),
     not to incidental prior main-process RNG consumption. No-op for non-dropout
     runs (__getitem__ draws no randomness then)."""
@@ -131,8 +131,8 @@ class Trainer:
             drop_last=True,
             pin_memory=self.is_cuda,
             persistent_workers=num_workers > 0,
-            # tie modality_dropout draws to cfg.seed (per worker, per rank), not to
-            # incidental prior RNG state; no-op for non-dropout runs.
+            # tie per-sample task draws to cfg.seed (per worker, per rank), not to
+            # incidental prior RNG state; no-op for single-task runs.
             worker_init_fn=(
                 functools.partial(
                     _seed_worker, base_seed=int(self.cfg.training.seed) + self.rank * 1000
@@ -276,6 +276,8 @@ class Trainer:
             sources.append(("cuff_", report["cuff"]))
         for infix, rep in sources:
             for key in ("SBP", "DBP", "MAP"):
+                if key not in rep:  # waveform-only report (an ECG/PPG translation task)
+                    continue
                 a, b = rep[key]["AAMI"], rep[key]["BHS"]
                 out[f"{prefix}/{infix}{key}_ME"] = float(a["ME"])
                 out[f"{prefix}/{infix}{key}_SDE"] = float(a["SDE"])
@@ -292,13 +294,17 @@ class Trainer:
     # -- training ----------------------------------------------------------
     def _prepare_batch(self, batch):
         abp = batch["abp_patches"].to(self.device, non_blocking=True)
-        cond = batch["cond_patches"].to(self.device, non_blocking=True)
-        cond_mask = batch["cond_mask"].to(self.device, non_blocking=True)
+        ecg = batch["ecg_patches"].to(self.device, non_blocking=True)
+        ppg = batch["ppg_patches"].to(self.device, non_blocking=True)
+        target_idx = batch["target_idx"].to(self.device, non_blocking=True)
+        cond_present = batch["cond_present"].to(self.device, non_blocking=True)
         rf = int(self.cfg.training.repeat_factor)
         if rf > 1:
             abp = abp.repeat(rf, 1, 1)
-            cond = cond.repeat(rf, 1, 1)
-            cond_mask = cond_mask.repeat(rf, 1)
+            ecg = ecg.repeat(rf, 1, 1)
+            ppg = ppg.repeat(rf, 1, 1)
+            target_idx = target_idx.repeat(rf)
+            cond_present = cond_present.repeat(rf, 1)
         # Demographics ride along as a global prior (not a CFG-dropped condition).
         demo = None
         if bool(self.cfg.model.use_demo) and "demo_cont" in batch:
@@ -308,27 +314,26 @@ class Trainer:
                 cont = cont.repeat(rf, 1)
                 gender = gender.repeat(rf)
             demo = (cont, gender)
-        return abp, cond, cond_mask, demo
+        return abp, ecg, ppg, target_idx, cond_present, demo
 
     def _train_step(self, batch) -> dict:
         lr = adjust_learning_rate(self.optimizer, self.global_step, self.cfg, self.lr_scale)
         with self._autocast():
-            abp, cond, cond_mask, demo = self._prepare_batch(batch)
+            abp, ecg, ppg, target_idx, cond_present, demo = self._prepare_batch(batch)
             loss_vec = flow_matching_loss(
-                self.model, self.fm, abp, cond,
+                self.model, self.fm, abp, ecg, ppg, target_idx, cond_present,
                 generator=self.gen,
                 logit_mean=float(self.cfg.sampling.logit_mean),
                 logit_scale=float(self.cfg.sampling.logit_scale),
                 prediction_type=str(self.cfg.sampling.prediction_type),
                 loss_type=str(self.cfg.training.loss_type),
                 demo=demo,
-                cond_mask=cond_mask,
-                per_sample=True,  # (B,) so we can decompose train loss by modality
+                per_sample=True,  # (B,) so we can decompose train loss by task
             )
             loss = loss_vec.mean()
 
-        # Full-epoch per-modality train loss, decomposed from this same forward.
-        self._accumulate_modality_loss(loss_vec, cond_mask)
+        # Full-epoch per-task train loss, decomposed from this same forward.
+        self._accumulate_task_loss(loss_vec, target_idx, cond_present)
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(
@@ -345,11 +350,11 @@ class Trainer:
         for ema, p in zip(self.ema_params, self.model_raw.parameters()):
             ema.lerp_(p.detach(), 1.0 - self.ema_decay)
 
-    # Full-epoch train loss broken down by modality, decomposed FROM the actual
-    # training loss (no extra forward): each sample's per-sample loss is bucketed
-    # by its live modality_dropout mask (matched against the shared MODALITY_MASK
-    # table, in MODALITY_ORDER), accumulated over the epoch, all-reduced across
-    # ranks, and logged as train/loss_<modality> + train/loss_epoch.
+    # Full-epoch train loss broken down by TASK, decomposed FROM the actual training
+    # loss (no extra forward): each sample's per-sample loss is bucketed by its drawn
+    # task (matched on (target_idx, cond_present) against TASK_SPEC, in TASK_ORDER),
+    # accumulated over the epoch, all-reduced across ranks, and logged as
+    # train/loss_<task> + train/loss_epoch. Task names use "2" for "->" in keys.
 
     def _all_reduce_sum(self, *tensors: torch.Tensor) -> None:
         """In-place SUM all_reduce across ranks (no-op when not distributed). The
@@ -362,18 +367,21 @@ class Trainer:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     def _reset_epoch_loss(self) -> None:
-        n = len(MODALITY_ORDER)
-        self._ep_loss_sum = torch.zeros(n, device=self.device)  # order = MODALITY_ORDER
+        n = len(TASK_ORDER)
+        self._ep_loss_sum = torch.zeros(n, device=self.device)  # order = TASK_ORDER
         self._ep_loss_cnt = torch.zeros(n, device=self.device)
 
     @torch.no_grad()
-    def _accumulate_modality_loss(self, loss_vec: torch.Tensor, cond_mask: torch.Tensor) -> None:
-        """Bucket per-sample train losses by the sample's presence mask, keyed by
-        the shared MODALITY_MASK table so bucket i always means MODALITY_ORDER[i]."""
+    def _accumulate_task_loss(
+        self, loss_vec: torch.Tensor, target_idx: torch.Tensor, cond_present: torch.Tensor
+    ) -> None:
+        """Bucket per-sample train losses by task, matching each sample's
+        (target_idx, cond_present) against TASK_SPEC so bucket i == TASK_ORDER[i]."""
         lv = loss_vec.detach().float()
-        for i, name in enumerate(MODALITY_ORDER):
-            me, mp = MODALITY_MASK[name]
-            m = (cond_mask[:, 0] == me) & (cond_mask[:, 1] == mp)
+        for i, name in enumerate(TASK_ORDER):
+            tidx, cp = TASK_SPEC[name]
+            cp_t = torch.tensor(cp, device=cond_present.device, dtype=cond_present.dtype)
+            m = (target_idx == tidx) & (cond_present == cp_t).all(dim=1)
             if m.any():
                 self._ep_loss_sum[i] += lv[m].sum()
                 self._ep_loss_cnt[i] += m.sum()
@@ -386,7 +394,7 @@ class Trainer:
         if not is_main_process():
             return
         data: dict = {}
-        for i, name in enumerate(MODALITY_ORDER):
+        for i, name in enumerate(TASK_ORDER):
             if c[i] > 0:
                 data[f"train/loss_{name}"] = float(s[i] / c[i])
         tot_c = float(c.sum())
@@ -524,7 +532,7 @@ class Trainer:
     def _batch_demo(self, batch):
         """Pull a (cont, gender) demographics sample from a batch, or None.
 
-        Left on CPU; ``sample_abp`` moves it to device. No repeat/drop here —
+        Left on CPU; ``sample_target`` moves it to device. No repeat/drop here —
         sampling uses the natural batch.
         """
         if not bool(self.cfg.model.use_demo) or "demo_cont" not in batch:
@@ -532,15 +540,19 @@ class Trainer:
         return batch["demo_cont"], batch["demo_gender"]
 
     @torch.no_grad()
-    def _sample_cond(self, cond_patches: torch.Tensor, demo=None, cond_mask=None) -> torch.Tensor:
-        """Core sampler; assumes model is already in the desired eval/param state."""
-        return sample_abp(
-            self.model_raw, self.fm, cond_patches,
+    def _sample_cond(
+        self, ecg_patches, ppg_patches, target_idx, cond_present, demo=None
+    ) -> torch.Tensor:
+        """Core sampler; assumes model is already in the desired eval/param state.
+
+        Returns the per-sample TARGET waveform (de-normalized by target modality)."""
+        return sample_target(
+            self.model_raw, self.fm, ecg_patches, ppg_patches, target_idx, cond_present,
             generator=self.gen, device=self.device,
             abp_mean=float(self.cfg.data.abp_mean), abp_std=float(self.cfg.data.abp_std),
+            cond_recenter=bool(self.cfg.data.cond_recenter),
             autocast_ctx=self._autocast(),
             demo=demo,
-            cond_mask=cond_mask,
         )
 
     @contextlib.contextmanager
@@ -565,7 +577,7 @@ class Trainer:
             yield
 
     @torch.no_grad()
-    def _distributed_eval(self, loader, desc: str, max_batches: int = -1, cond_mask_override=None):
+    def _distributed_eval(self, loader, desc: str, max_batches: int = -1, task_override=None):
         """Sample this rank's loader shard, gather PER-SEGMENT quantities to rank 0,
         and assemble a full report there (None on other ranks).
 
@@ -576,39 +588,58 @@ class Trainer:
         the EMA swap / best-weights load). ALL ranks must call this together — the
         all_gather is a collective; an early per-rank return would deadlock.
 
-        ``cond_mask_override`` (a ``(2,)`` [ecg_present, ppg_present] tensor) forces
-        the conditioning DIRECTION for every batch, ignoring the loader's per-sample
-        cond_mask — used by ``validate()`` to score each trained direction of a
-        unified model on the same segments. ``None`` = use the batch's cond_mask.
+        ``task_override`` (an ABP-target task name, e.g. ``"ppg2abp"``) forces the
+        DIRECTION for every batch, ignoring the loader's per-sample task — used by
+        ``validate()`` to score each trained ->ABP direction on the same segments.
+        ``None`` = use the batch's task. This eval is ABP-specific (clinical metrics
+        vs ``abp_raw``), so only ABP-target tasks are valid here.
         """
         was_training = self.model_raw.training
         self.model_raw.eval()
-        # `*_t` = waveform-truth BP (per-beat on the true wave); `*_c` = CSV cuff
-        # label, gathered only when the dataset loaded bp_true (eval_true_source
-        # csv/both) → enables a second, parallel clinical truth source.
-        keys = ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t", "ae", "se", "r",
-                "sbp_c", "dbp_c", "map_c")
+        # Single TARGET modality for this call (validate() always passes a task;
+        # None = ABP-from-batch for back-compat). ABP target → waveform + clinical
+        # BP cols; ECG/PPG translation target → waveform-only (segment_bp is
+        # meaningless on ECG/PPG). `*_t` = waveform-truth BP; `*_c` = CSV cuff label.
+        if task_override is not None:
+            tgt_idx, cp = TASK_SPEC[task_override]
+        else:
+            tgt_idx, cp = 0, None
+        is_abp = tgt_idx == 0
+        shift = 0.5 if bool(self.cfg.data.cond_recenter) else 0.0  # un-recenter ECG/PPG gt
+        keys = ("ae", "se", "r") + (
+            ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t", "sbp_c", "dbp_c", "map_c")
+            if is_abp else ()
+        )
         cols: dict = {k: [] for k in keys}
         for bi, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=not is_main_process())):
             if 0 < max_batches <= bi:
                 break
-            cm = batch.get("cond_mask")
-            if cond_mask_override is not None:  # force one direction for every batch
-                cm = cond_mask_override.view(1, 2).repeat(batch["cond_patches"].shape[0], 1)
+            bs = batch["ecg_patches"].shape[0]
+            if task_override is not None:  # force this task's direction for every batch
+                target_idx = torch.full((bs,), tgt_idx, dtype=torch.long)
+                cond_present = torch.tensor(cp, dtype=torch.float32).view(1, 3).repeat(bs, 1)
+            else:
+                target_idx = batch["target_idx"]
+                cond_present = batch["cond_present"]
             pred = self._sample_cond(
-                batch["cond_patches"], self._batch_demo(batch), cm
-            )  # (b, L) mmHg on CPU
-            gt = batch["abp_raw"]
-            pbp, tbp = segment_bp(pred), segment_bp(gt)
+                batch["ecg_patches"], batch["ppg_patches"], target_idx, cond_present,
+                self._batch_demo(batch),
+            )  # (b, L) target waveform on CPU
+            if is_abp:
+                gt = batch["abp_raw"]
+            else:  # clean ECG/PPG wave = un-patchify the recentered patches + shift
+                gt = unpatchify(batch["ecg_patches"] if tgt_idx == 1 else batch["ppg_patches"]) + shift
             err = pred - gt
-            cols["sbp_p"].append(pbp["SBP"]); cols["dbp_p"].append(pbp["DBP"]); cols["map_p"].append(pbp["MAP"])
-            cols["sbp_t"].append(tbp["SBP"]); cols["dbp_t"].append(tbp["DBP"]); cols["map_t"].append(tbp["MAP"])
             cols["ae"].append(err.abs().mean(dim=1))   # (b,) per-segment MAE
             cols["se"].append((err ** 2).mean(dim=1))  # (b,) per-segment MSE
             cols["r"].append(_pearson(pred, gt))        # (b,) per-segment Pearson
-            cuff = batch.get("bp_true")  # (b, 3) [SBP, DBP, MAP] cuff label, or None
-            if cuff is not None:
-                cols["sbp_c"].append(cuff[:, 0]); cols["dbp_c"].append(cuff[:, 1]); cols["map_c"].append(cuff[:, 2])
+            if is_abp:
+                pbp, tbp = segment_bp(pred), segment_bp(gt)
+                cols["sbp_p"].append(pbp["SBP"]); cols["dbp_p"].append(pbp["DBP"]); cols["map_p"].append(pbp["MAP"])
+                cols["sbp_t"].append(tbp["SBP"]); cols["dbp_t"].append(tbp["DBP"]); cols["map_t"].append(tbp["MAP"])
+                cuff = batch.get("bp_true")  # (b, 3) [SBP, DBP, MAP] cuff label, or None
+                if cuff is not None:
+                    cols["sbp_c"].append(cuff[:, 0]); cols["dbp_c"].append(cuff[:, 1]); cols["map_c"].append(cuff[:, 2])
         if was_training:
             self.model_raw.train()
         # Drop empty cuff cols when no bp_true was present → gathered dict keys stay
@@ -649,6 +680,8 @@ class Trainer:
             "RMSE": m["se"].mean().sqrt().item(),
             "Pearson": m["r"].mean().item(),
         }}
+        if "sbp_p" not in m:  # ECG/PPG translation target -> waveform fidelity only
+            return report
         pred_bp = {"SBP": m["sbp_p"], "DBP": m["dbp_p"], "MAP": m["map_p"]}
         true_bp = {"SBP": m["sbp_t"], "DBP": m["dbp_t"], "MAP": m["map_t"]}
         for key in ("SBP", "DBP", "MAP"):
@@ -661,74 +694,71 @@ class Trainer:
             }
         return report
 
-    def _active_modalities(self) -> list:
-        """Trained directions in MODALITY_ORDER (specialist → its 1; unified → every
-        modality with prob>0). Pure cfg → identical on every rank, so it's safe to
-        drive the per-direction DDP-collective loops in validate()/_val_modality_losses."""
-        trained = trained_modalities(
-            str(self.cfg.data.cond_modality),
-            bool(self.cfg.data.modality_dropout),
-            self.cfg.data.modality_dropout_probs,
+    def _active_tasks(self) -> list:
+        """Trained tasks in TASK_ORDER. Pure cfg → identical on every rank, so it's
+        safe to drive the per-task DDP-collective loops in validate()/_val_task_losses."""
+        trained = trained_tasks(
+            list(self.cfg.data.tasks) if getattr(self.cfg.data, "tasks", None) else None,
+            list(self.cfg.data.task_probs) if getattr(self.cfg.data, "task_probs", None) else None,
         )
-        return [m for m in MODALITY_ORDER if m in trained]
+        return [t for t in TASK_ORDER if t in trained]
+
+    def _active_abp_tasks(self) -> list:
+        """Trained ->ABP tasks — the directions whose ABP recon drives best/early-stop."""
+        return [t for t in self._active_tasks() if t in ABP_TASKS]
 
     @torch.no_grad()
-    def _val_modality_losses(self, max_batches: int) -> dict:
-        """Per-modality flow-matching loss on the val split (ecg_ppg / ecg / ppg).
+    def _val_task_losses(self, max_batches: int) -> dict:
+        """Per-task flow-matching loss on the val split (every trained task).
 
-        Monitor-only — NOT used for best/plateau/early-stop (val MAE drives those);
-        handy to watch how a unified (modality_dropout) model fits each direction.
-        Per batch the SAME noise & timesteps (fixed per-batch seed) are reused
-        across the three modalities, so only cond_mask differs → a paired,
-        epoch-comparable signal (the val loader is unshuffled). Comparable WITHIN a
-        run; the absolute value depends on world_size (max_batches is per-rank).
-        DDP: each rank sums its shard into a device
-        tensor, then ONE all_reduce; every rank must call this together (the
-        all_reduce is a collective), so it runs before validate()'s rank-0 early
-        return. Uses eager model_raw under the caller's EMA swap.
+        Monitor-only — NOT used for best/plateau/early-stop (ABP val MAE drives
+        those); for ECG↔PPG translation tasks it is the main tracked signal. Per
+        batch a fixed per-batch seed is reused across tasks & epochs → an
+        epoch-comparable signal (val loader unshuffled). Absolute value depends on
+        world_size (max_batches is per-rank). DDP: each rank sums its shard, then
+        ONE all_reduce; every rank must call this together (collective), so it runs
+        before validate()'s rank-0 return. Uses eager model_raw under the EMA swap.
         """
         if self.val_loader is None or max_batches == 0:  # 0 = off; <0 = full; >0 = cap
             return {}
-        # only the directions the model trains on (specialist -> its 1 direction;
-        # dropout -> every modality with prob>0), so a specialist doesn't pay 3x
-        # for two uninformative directions. Same on every rank → DDP-safe size.
-        active = self._active_modalities()
+        active = self._active_tasks()
+        specs = [TASK_SPEC[t] for t in active]
         base_seed = int(self.cfg.training.seed)
         use_demo = bool(self.cfg.model.use_demo)
         was_training = self.model_raw.training
         self.model_raw.eval()
         gen = torch.Generator(device=self.device)
-        # one (1,2) mask per active modality, built once; _apply_null needs it
-        # broadcast to the batch, so .repeat(bs,1) below (a contiguous view).
-        masks = [torch.tensor([MODALITY_MASK[m]], device=self.device) for m in active]
         sums = torch.zeros(len(active), device=self.device)  # loss*bs, no per-batch sync
         n = 0
         for bi, batch in enumerate(self.val_loader):
             if 0 < max_batches <= bi:
                 break
             abp = batch["abp_patches"].to(self.device, non_blocking=True)
-            cond = batch["cond_patches"].to(self.device, non_blocking=True)
+            ecg = batch["ecg_patches"].to(self.device, non_blocking=True)
+            ppg = batch["ppg_patches"].to(self.device, non_blocking=True)
             bs = abp.shape[0]
             demo = None
             if use_demo and "demo_cont" in batch:
                 demo = (batch["demo_cont"].to(self.device), batch["demo_gender"].to(self.device))
             with self._autocast():
-                for i, mask in enumerate(masks):
-                    gen.manual_seed(base_seed + bi)  # same noise/t across modalities & epochs
+                for i, (tidx, cp) in enumerate(specs):
+                    gen.manual_seed(base_seed + bi)  # same noise/t across tasks & epochs
+                    ti = torch.full((bs,), tidx, dtype=torch.long, device=self.device)
+                    cpr = torch.tensor(cp, device=self.device).view(1, 3).repeat(bs, 1)
                     loss = flow_matching_loss(
-                        self.model_raw, self.fm, abp, cond,
+                        self.model_raw, self.fm, abp, ecg, ppg, ti, cpr,
                         generator=gen,
                         logit_mean=float(self.cfg.sampling.logit_mean),
                         logit_scale=float(self.cfg.sampling.logit_scale),
                         prediction_type=str(self.cfg.sampling.prediction_type),
                         loss_type=str(self.cfg.training.loss_type),
-                        demo=demo, cond_mask=mask.repeat(bs, 1),
+                        demo=demo,
                     )
                     sums[i] += loss.detach().float() * bs  # fp32 like the train path
             n += bs
         if was_training:
             self.model_raw.train()
-        t = torch.cat([sums.new_tensor([float(n)]), sums])  # [n, sum_ecg_ppg, sum_ecg, sum_ppg]
+        t = torch.cat([sums.new_tensor([float(n)]), sums])
         self._all_reduce_sum(t)
         vals = t.tolist()  # single device→host transfer
         n = max(int(vals[0]), 1)
@@ -740,55 +770,53 @@ class Trainer:
         elsewhere). Uses the current in-memory EMA weights on the val_loader,
         already stride-subsampled to ``val_eval_fraction``.
 
-        Scores EVERY trained direction (``trained_modalities``: specialist -> its 1
-        direction; unified/modality_dropout -> every modality with prob>0), running
-        the ODE sampler once per direction on the SAME val segments via a forced
-        cond_mask. The returned/decision MAE is the MEAN across directions, so
-        best-ckpt / plateau / early-stop optimise all served directions jointly (not
-        just ecg_ppg). A specialist has one direction -> identical to the old
-        single-direction behaviour. Logged: the full per-direction report as FLAT
-        keys ``val/<metric>_<modality>`` (e.g. ``val/MAE_<m>``, ``val/SBP_AAMI_pass_<m>``;
-        suffix style mirrors ``val/loss_<modality>`` → each metric's directions sit in
-        one chart, not nested ``val/<m>/*`` groups), and top-level
-        ``val/MAE|RMSE|Pearson`` as the across-direction means.
+        Runs the ODE sampler once per trained task (``_active_tasks``) on the SAME
+        val segments via a forced task → a full val result for EVERY task: ->ABP
+        tasks get waveform + clinical (AAMI/BHS); ECG/PPG translation tasks get
+        waveform-only (MAE/RMSE/Pearson in normalized units). Logged as FLAT keys
+        ``val/<metric>_<task>`` (clean identifiers, e.g. ``val/MAE_ppg2abp``,
+        ``val/MAE_ppg2ecg``) plus ``val/loss_<task>`` per task. The returned/decision
+        MAE is the MEAN waveform MAE over the ->ABP directions ONLY (translation MAE
+        is in normalized units, not comparable / not the goal), so best-ckpt /
+        plateau / early-stop optimise the served ->ABP directions jointly; top-level
+        ``val/MAE|RMSE|Pearson`` = that ->ABP mean.
 
-        ``val/*`` is logged with ``step=epoch``. Cost: the sampler runs |directions|
-        times (3x for a unified model)."""
+        ``val/*`` is logged with ``step=epoch``. Cost: the sampler runs once per
+        trained task (e.g. 5x for the full task set)."""
         if self.val_loader is None:
             return float("inf")
-        # SAME order on every rank → the per-direction all_gather stays symmetric.
-        active = self._active_modalities()
+        # SAME order on every rank → the per-task all_gather stays symmetric.
+        active = self._active_tasks()                 # every trained task gets a val result
+        abp_tasks = self._active_abp_tasks() or active  # ->ABP drives the decision (fallback: all)
         reports: dict = {}
         with self._ema_swapped(self.use_ema):
-            for m in active:
-                mask = torch.tensor(MODALITY_MASK[m], dtype=torch.float32)
-                reports[m] = self._distributed_eval(self.val_loader, f"val:{m}", -1, cond_mask_override=mask)
+            for t in active:
+                reports[t] = self._distributed_eval(self.val_loader, f"val:{t}", -1, task_override=t)
             # all ranks must enter (all_reduce inside) — before the rank-0 return
-            mod_losses = self._val_modality_losses(int(self.cfg.training.val_loss_max_batches))
+            task_losses = self._val_task_losses(int(self.cfg.training.val_loss_max_batches))
         if not is_main_process() or not reports or any(r is None for r in reports.values()):
             return float("inf")
-        # per-direction detail + across-direction mean (the mean MAE is the decision
-        # metric driving best/plateau/early-stop via the return value).
+        # per-task detail + ->ABP mean (the mean MAE is the decision metric driving
+        # best/plateau/early-stop via the return value).
         metrics: dict = {}
-        for m, rep in reports.items():
-            # full per-direction report as FLAT keys: val/MAE_<m>, val/RMSE_<m>,
-            # val/SBP_AAMI_pass_<m>, ... (suffix style, mirrors val/loss_<m>) — NOT
-            # nested val/<m>/* groups, so each metric's 3 directions sit in one chart.
+        for t, rep in reports.items():
             for k, v in self._flat_report(rep, "val").items():
-                metrics[f"{k}_{m}"] = v
-        def _mean(key: str) -> float:
-            return sum(float(r["waveform"][key]) for r in reports.values()) / len(reports)
-        metrics["val/MAE"], metrics["val/RMSE"], metrics["val/Pearson"] = _mean("MAE"), _mean("RMSE"), _mean("Pearson")
-        for k, v in mod_losses.items():
+                metrics[f"{k}_{t}"] = v  # task names are already clean identifiers (ppg2abp)
+        def _abp_mean(key: str) -> float:
+            return sum(float(reports[t]["waveform"][key]) for t in abp_tasks) / len(abp_tasks)
+        metrics["val/MAE"], metrics["val/RMSE"], metrics["val/Pearson"] = (
+            _abp_mean("MAE"), _abp_mean("RMSE"), _abp_mean("Pearson")
+        )
+        for k, v in task_losses.items():
             metrics[f"val/loss_{k}"] = v
         self._sw_log(metrics, epoch)
-        detail = "  ".join(f"{m}={metrics[f'val/MAE_{m}']:.4f}" for m in active)  # reuse the stored per-dir MAE
+        detail = "  ".join(f"{t}={float(reports[t]['waveform']['MAE']):.4f}" for t in active)
         # CONTRACT: tune_modality_probs.py regex-parses "MAE mean=<float>" off this line
         # for ASHA pruning — keep that token if you reword it, or pruning silently no-ops.
-        logger.info("[val] MAE mean=%.4f mmHg over [%s]  (%s)", metrics["val/MAE"], ",".join(active), detail)
-        if mod_losses:
+        logger.info("[val] MAE mean=%.4f mmHg over [%s]  (%s)", metrics["val/MAE"], ",".join(abp_tasks), detail)
+        if task_losses:
             logger.info("[val] flow-matching loss  %s",
-                        "  ".join(f"{k}={v:.4f}" for k, v in mod_losses.items()))
+                        "  ".join(f"{k}={v:.4f}" for k, v in task_losses.items()))
         return float(metrics["val/MAE"])
 
     # -- final test --------------------------------------------------------

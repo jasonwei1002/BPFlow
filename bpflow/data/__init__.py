@@ -5,16 +5,18 @@ from typing import Callable, Dict
 from torch.utils.data import Dataset
 
 from .pulsedb_dataset import (
-    DEFAULT_MODALITY_DROPOUT_PROBS,
-    MODALITY_MASK,
-    MODALITY_ORDER,
+    ABP_TASKS,
+    DEFAULT_TASK_PROBS,
+    TARGET_ORDER,
+    TASK_ORDER,
+    TASK_SPEC,
     PulseDBDataset,
     build_dataset,
-    trained_modalities,
+    resolve_tasks,
+    trained_tasks,
 )
 from .transforms import (
     DEMO_CONT_DIM,
-    build_cond_patches,
     destandardize_abp,
     patchify,
     standardize_abp,
@@ -38,17 +40,19 @@ def register_dataset(name: str) -> Callable[[Callable[..., Dataset]], Callable[.
 __all__ = [
     "PulseDBDataset",
     "build_dataset",
-    "MODALITY_ORDER",
-    "MODALITY_MASK",
-    "DEFAULT_MODALITY_DROPOUT_PROBS",
-    "trained_modalities",
+    "TARGET_ORDER",
+    "TASK_ORDER",
+    "TASK_SPEC",
+    "ABP_TASKS",
+    "DEFAULT_TASK_PROBS",
+    "resolve_tasks",
+    "trained_tasks",
     "DATASET_REGISTRY",
     "register_dataset",
     "standardize_abp",
     "destandardize_abp",
     "patchify",
     "unpatchify",
-    "build_cond_patches",
     "standardize_demo",
     "DEMO_CONT_DIM",
 ]

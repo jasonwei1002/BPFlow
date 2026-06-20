@@ -40,26 +40,6 @@ def unpatchify(p: torch.Tensor) -> torch.Tensor:
     return p.reshape(*prefix, n * patch_size)
 
 
-def build_cond_patches(
-    ecg: torch.Tensor, ppg: torch.Tensor, patch_size: int, recenter: bool = True
-) -> torch.Tensor:
-    """Stack ECG+PPG into channel-major condition patches.
-
-    (..., L), (..., L) -> (..., N, 2P): per token, P ECG samples then P PPG.
-
-    Both streams are always included in full. Which modality actually conditions
-    the model is selected downstream by the per-sample ``cond_mask``: the model
-    replaces a masked stream's embedding with a learned null token (see
-    ``BPFlowModel._apply_null``), not by zeroing the input here.
-    """
-    if recenter:
-        ecg = ecg - 0.5
-        ppg = ppg - 0.5
-    ecg_p = patchify(ecg, patch_size)  # (..., N, P)
-    ppg_p = patchify(ppg, patch_size)  # (..., N, P)
-    return torch.cat([ecg_p, ppg_p], dim=-1)  # (..., N, 2P)
-
-
 # Continuous demo channels, in the fixed order the model's DemoEncoder expects.
 DEMO_CONT_DIM = 5  # [age, height, weight, bmi, body_missing_flag]
 

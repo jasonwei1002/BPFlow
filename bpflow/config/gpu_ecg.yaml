@@ -1,15 +1,14 @@
 # ECG-only specialist (pure ECG -> ABP). Inherits gpu.yaml; the ONLY change vs the
-# UNIFIED default (base.yaml modality_dropout: true) is the conditioning direction:
-#   modality_dropout: false -> no per-sample modality draw; EVERY split (train/val/
-#                              test) uses the fixed direction below, so val MAE
-#                              measures the ecg direction -> correct best-ckpt/early-stop.
-#   cond_modality: ecg      -> cond_mask [1,0]; the PPG stream is replaced by the
-#                              learned null_ppg (no PPG data enters). The model never
-#                              sees PPG. trained_modalities() = {ecg}, baked into the
-#                              saved config so infer.sh auto-evaluates just ecg.
+# UNIFIED default (base.yaml trains all five tasks) is a single-task list:
+#   tasks: [ecg2abp]   -> every split (train/val/test) uses the one direction, so
+#                         val MAE measures the ecg2abp direction -> correct
+#                         best-ckpt/early-stop. The PPG stream is masked out of joint
+#                         attention (task-routing mask); the model never sees PPG.
+#   trained_tasks() = {ecg2abp}, baked into the saved config so infer auto-evaluates
+#   just that direction.
 # Pretrain:  bash train.sh --config bpflow/config/gpu_ecg.yaml
 _base_: gpu.yaml
 
 data:
-  modality_dropout: false   # specialist: no modality draw (overrides base's unified true)
-  cond_modality: ecg        # ECG -> ABP on all splits
+  tasks: [ecg2abp]    # specialist: the single trained (cond->target) task
+  task_probs: []      # single task -> uniform (i.e. always this task)

@@ -21,13 +21,19 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from .data import MODALITY_MASK, MODALITY_ORDER, build_dataset, trained_modalities
-from .eval import evaluate, format_report, segment_bp
+from .data import TASK_ORDER, TASK_SPEC, build_dataset, trained_tasks, unpatchify
+from .eval import evaluate, format_report, segment_bp, waveform_metrics
 from .model import build_model
-from .sampling import build_flow_matching, sample_abp
+from .sampling import build_flow_matching, sample_target
 from .trainer_utils import load_config, load_model_state, pick_device, set_seed
 
 logger = logging.getLogger(__name__)
+
+
+def _arrow(task: str) -> str:
+    """Readable 'COND -> TARGET' label from a task name (ppg2abp -> 'PPG -> ABP')."""
+    cond, tgt = task.split("2", 1)
+    return f"{cond.upper().replace('_', '+')} -> {tgt.upper()}"
 
 
 def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) -> set:
@@ -40,20 +46,13 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
                     f"{key} mismatch: ckpt={ckpt[key]} cfg={getattr(cfg.data, key)}. "
                     "Use the config the checkpoint was trained with."
                 )
-        # The set of directions the checkpoint actually TRAINED on (caller picks
-        # which to infer; inferring an untrained direction would feed the absent
-        # stream's null token an unseen state → junk output). The trained set is:
-        #   - modality_dropout: every modality with prob > 0 (the unified case;
-        #     degenerate probs like [1,0,0] correctly collapse to one direction).
-        #   - specialist (no dropout): just the fixed cond_modality.
-        #   - old checkpoints predate both fields → {ecg_ppg}.
+        # The set of TASKS the checkpoint actually TRAINED on (caller picks which to
+        # evaluate — an untrained task yields junk). New checkpoints store
+        # data.tasks/task_probs; trained_tasks() resolves the set. A checkpoint with
+        # no tasks field (e.g. base default) → all five tasks.
         ck_cfg = ckpt.get("config")
         ck_data = ck_cfg.get("data", {}) if isinstance(ck_cfg, dict) else {}
-        ck_modality = str(ck_data.get("cond_modality", "ecg_ppg"))
-        ck_dropout = bool(ck_data.get("modality_dropout", False))
-        trained = trained_modalities(
-            ck_modality, ck_dropout, ck_data.get("modality_dropout_probs")
-        )
+        trained = trained_tasks(ck_data.get("tasks") or None, ck_data.get("task_probs") or None)
         if use_ema and "model_ema" in ckpt:
             state = ckpt["model_ema"]
             logger.info("Loading EMA weights from %s", ckpt_path)
@@ -62,21 +61,24 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
             logger.info("Loading model weights from %s", ckpt_path)
     else:
         state = ckpt  # flat state_dict (no config) → assume the historical default
-        trained = {"ecg_ppg"}
+        trained = {"ecg_ppg2abp"}
         logger.info("Loading flat state_dict from %s", ckpt_path)
-    # Drops removed-feature keys (old CFG/meta), tolerates new params missing in
-    # older checkpoints (null tokens), and flags any real architecture mismatch.
+    # Drops removed-feature keys, flags any real architecture mismatch.
     load_model_state(model, state)
     return trained
 
 
-def _build_reports(pred, gt, bp, source: str) -> dict:
-    """Clinical/waveform reports for one direction's gathered predictions.
+def _build_reports(pred, gt, bp, source: str, target_idx: int) -> dict:
+    """Reports for one task's gathered predictions.
 
-    ``source`` (waveform/csv/both) picks the BP TRUE: per-beat on the true wave
-    (``true_waveform``) and/or the CSV cuff label (``true_csv``). PRED is always
-    per-beat from the generated wave; waveform MAE/RMSE/Pearson are source-agnostic.
+    For an ABP target (``target_idx == 0``): clinical + waveform, with ``source``
+    (waveform/csv/both) picking the BP TRUE — per-beat on the true wave
+    (``true_waveform``) and/or the CSV cuff label (``true_csv``). For an ECG/PPG
+    translation target: waveform-only (MAE/RMSE/Pearson in normalized [0,1] units;
+    clinical BP metrics and the CSV cuff don't apply).
     """
+    if target_idx != 0:  # ECG / PPG translation target -> waveform fidelity only
+        return {"true_waveform": {"waveform": waveform_metrics(pred, gt)}}
     true_bp = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]} if bp is not None else None
     if source in ("csv", "both") and true_bp is None:
         raise RuntimeError(
@@ -92,35 +94,46 @@ def _build_reports(pred, gt, bp, source: str) -> dict:
 
 
 @torch.no_grad()
-def _sample_and_gather(modality, loader, model, fm, gen, device, cfg, seed,
+def _sample_and_gather(task, loader, model, fm, gen, device, cfg, seed,
                        distributed, world_size, is_main, total):
-    """Sample the whole (sharded) loader for ONE input direction, gather to rank 0.
+    """Sample the whole (sharded) loader for ONE task, gather to rank 0.
 
-    Overrides each batch's cond_mask with ``MODALITY_MASK[modality]`` so a single
-    dataset build serves every direction (cond_patches always carries both
-    streams; the model nulls the absent one). Re-seeds the generator so every
-    direction sees identical initial noise → a paired comparison. ALL ranks must
-    call this together — the all_gather is a collective. Returns ``(pred, gt, bp)``
-    on rank 0 (cuff ``bp`` may be None); ``(None, None, None)`` on other ranks.
+    ``task`` is a TASK_SPEC name (e.g. ppg2abp, ppg2ecg): it fixes the target
+    modality + present conditions. A single dataset build serves every task
+    (ecg/ppg patches always carried; absent streams masked out of joint attention).
+    The ground truth is the TARGET modality's clean wave (abp_raw for ABP; the
+    recentered ECG/PPG patches un-patchified + un-recentered otherwise). Re-seeds the
+    generator so every task sees identical initial noise → a paired comparison. ALL
+    ranks must call this together — the all_gather is a collective. Returns
+    ``(pred, gt, bp)`` on rank 0 (cuff ``bp`` is None for non-ABP / no-CSV);
+    ``(None, None, None)`` on other ranks.
     """
-    gen.manual_seed(seed)  # same noise across directions → paired comparison
-    mask_row = torch.tensor(MODALITY_MASK[modality], dtype=torch.float32)
+    gen.manual_seed(seed)  # same noise across tasks → paired comparison
+    tidx, cp = TASK_SPEC[task]
+    cp_row = torch.tensor(cp, dtype=torch.float32)
     use_demo = bool(cfg.model.use_demo)
     abp_mean, abp_std = float(cfg.data.abp_mean), float(cfg.data.abp_std)
+    cond_recenter = bool(cfg.data.cond_recenter)
+    shift = 0.5 if cond_recenter else 0.0  # un-recenter ECG/PPG ground truth
     preds, gts, bps = [], [], []
-    tag = f"infer:{modality} (rank0 shard of {total})" if distributed else f"infer:{modality} ({total})"
+    tag = f"infer:{task} (rank0 shard of {total})" if distributed else f"infer:{task} ({total})"
     for batch in tqdm(loader, desc=tag, disable=not is_main):
         demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
-        bs = batch["cond_patches"].shape[0]
-        out = sample_abp(
-            model, fm, batch["cond_patches"], generator=gen, device=device,
-            abp_mean=abp_mean, abp_std=abp_std,
-            demo=demo, cond_mask=mask_row.repeat(bs, 1),
+        bs = batch["ecg_patches"].shape[0]
+        out = sample_target(
+            model, fm, batch["ecg_patches"], batch["ppg_patches"],
+            torch.full((bs,), tidx, dtype=torch.long), cp_row.view(1, 3).repeat(bs, 1),
+            generator=gen, device=device, abp_mean=abp_mean, abp_std=abp_std,
+            cond_recenter=cond_recenter, demo=demo,
         )
         preds.append(out.cpu())
-        gts.append(batch["abp_raw"].cpu())
-        if "bp_true" in batch:  # CSV cuff [SBP, DBP, MAP] -> clinical TRUE
-            bps.append(batch["bp_true"].cpu())
+        if tidx == 0:
+            gts.append(batch["abp_raw"].cpu())
+            if "bp_true" in batch:  # CSV cuff [SBP, DBP, MAP] -> clinical TRUE (ABP only)
+                bps.append(batch["bp_true"].cpu())
+        else:  # ECG/PPG target: clean wave = un-patchify the recentered patches + shift
+            key = "ecg_patches" if tidx == 1 else "ppg_patches"
+            gts.append((unpatchify(batch[key]) + shift).cpu())
     pred = torch.cat(preds, dim=0) if preds else None
     gt = torch.cat(gts, dim=0) if gts else None
     bp = torch.cat(bps, dim=0) if bps else None
@@ -189,68 +202,70 @@ def run_inference(args: argparse.Namespace) -> None:
     fm = build_flow_matching(cfg)
     gen = torch.Generator(device=device)
 
-    # Which input direction(s) to evaluate. 'all' (default) = every direction the
-    # checkpoint trained on (unified -> 3; specialist -> its 1); else the pinned
-    # one, which must be in the trained set (an untrained direction yields junk).
-    if args.cond_modality == "all":
-        modalities = [m for m in MODALITY_ORDER if m in trained]
-    elif args.cond_modality in trained:
-        modalities = [args.cond_modality]
+    # Which task(s) to evaluate. 'all' (default) = EVERY task the checkpoint trained
+    # on (in TASK_ORDER); else the pinned one, which must be in the trained set (an
+    # untrained task yields junk). ABP-target tasks get clinical+waveform; ECG/PPG
+    # translation tasks get waveform-only.
+    if args.task == "all":
+        tasks_to_eval = [t for t in TASK_ORDER if t in trained]
+    elif args.task in trained:
+        tasks_to_eval = [args.task]
     else:
         raise ValueError(
-            f"--cond-modality {args.cond_modality!r} not in the checkpoint's trained "
-            f"modalities {sorted(trained)}. Infer only a direction the checkpoint saw."
+            f"--task {args.task!r} not in the checkpoint's trained tasks "
+            f"{sorted(trained)}. Evaluate only a task the checkpoint saw."
         )
     # Validate up front (BEFORE any collective) so every rank fails together — a
-    # late/asymmetric raise inside the modality loop would deadlock DDP.
-    if not modalities:  # e.g. a checkpoint whose modality_dropout_probs are all 0
-        raise ValueError(f"no trained directions to evaluate (trained={sorted(trained)})")
+    # late/asymmetric raise inside the task loop would deadlock DDP.
+    if not tasks_to_eval:
+        raise ValueError(f"no trained tasks to evaluate (trained={sorted(trained)})")
     source = str(args.true_source or cfg.data.eval_true_source)
     if source not in ("waveform", "csv", "both"):
         raise ValueError(f"eval_true_source must be waveform/csv/both, got {source!r}")
 
     out_dir = Path(args.out)
-    multi = len(modalities) > 1
+    multi = len(tasks_to_eval) > 1
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("evaluating modalities %s [true=%s]", modalities, source)
+        logger.info("evaluating tasks %s [true=%s]", tasks_to_eval, source)
 
-    # Every rank must enter _sample_and_gather for EVERY modality (its all_gather is
-    # a collective). So rank-0-only reporting is wrapped in try/except and the first
+    # Every rank must enter _sample_and_gather for EVERY task (its all_gather is a
+    # collective). So rank-0-only reporting is wrapped in try/except and the first
     # error is DEFERRED: the loop keeps running (all collectives complete), the group
     # is torn down, and only then is the error re-raised — a reporting failure (e.g.
     # missing CSV under --true-source csv) can never strand the other ranks mid-loop.
     results: dict = {}
     deferred_error = None
-    for m in modalities:
+    for t in tasks_to_eval:
+        target_idx = TASK_SPEC[t][0]
         pred, gt, bp = _sample_and_gather(
-            m, loader, model, fm, gen, device, cfg, args.seed,
+            t, loader, model, fm, gen, device, cfg, args.seed,
             distributed, world_size, is_main, total,
         )
         if not is_main:
-            continue  # keep looping so every direction's all_gather stays aligned
+            continue  # keep looping so every task's all_gather stays aligned
         try:
             if pred is None:
-                raise RuntimeError(f"no segments evaluated for modality {m!r}")
-            reports = _build_reports(pred, gt, bp, source)
-            results[m] = next(iter(reports.values())) if len(reports) == 1 else reports
-            logger.info("[%s] %d segments across %d process(es)", m, pred.shape[0], world_size)
+                raise RuntimeError(f"no segments evaluated for task {t!r}")
+            reports = _build_reports(pred, gt, bp, source, target_idx)
+            results[t] = next(iter(reports.values())) if len(reports) == 1 else reports
+            logger.info("[%s] %d segments across %d process(es)", t, pred.shape[0], world_size)
             for name, rep in reports.items():
-                logger.info("[%s/%s]\n%s", m, name, format_report(rep))
-            suffix = f"_{m}" if multi else ""
-            arrow = f"{m.upper().replace('_', '+')} → ABP"  # e.g. "ECG+PPG -> ABP"
+                logger.info("[%s/%s]\n%s", t, name, format_report(rep))
+            suffix = f"_{t}" if multi else ""
+            arrow = _arrow(t)
             if args.save_waveforms:
                 import numpy as np
 
-                np.save(out_dir / f"pred_mmhg{suffix}.npy", pred.numpy())
-                np.save(out_dir / f"gt_mmhg{suffix}.npy", gt.numpy())
+                np.save(out_dir / f"pred{suffix}.npy", pred.numpy())
+                np.save(out_dir / f"gt{suffix}.npy", gt.numpy())
                 logger.info("waveforms -> %s", out_dir)
             if args.plot > 0:
                 _plot(pred, gt, out_dir, args.plot, suffix, title=arrow)
-            if args.bland_altman:
-                # Per-beat BP agreement, one figure per truth source (mirrors the
-                # report keys). pred_bp is computed once and reused across sources.
-                pred_bp = segment_bp(pred)
+            # Bland-Altman is BP-beat agreement -> ABP-target tasks only (segment_bp
+            # is meaningless on an ECG/PPG waveform).
+            if args.bland_altman and target_idx == 0:
+                pred_bp = segment_bp(pred)  # computed once, reused across truth sources
                 if source in ("waveform", "both"):
                     _bland_altman(pred_bp, segment_bp(gt), out_dir, f"waveform{suffix}",
                                   title=f"{arrow}  (waveform truth)")
@@ -270,10 +285,10 @@ def run_inference(args: argparse.Namespace) -> None:
     if deferred_error is not None:
         raise deferred_error
 
-    # single direction -> flat report (back-compat); multiple -> {modality: report}
-    payload = results[modalities[0]] if not multi else results
+    # single task -> flat report (back-compat); multiple -> {task: report}
+    payload = results[tasks_to_eval[0]] if not multi else results
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2))
-    logger.info("metrics (%s) -> %s", "+".join(modalities), out_dir / "metrics.json")
+    logger.info("metrics (%s) -> %s", "+".join(tasks_to_eval), out_dir / "metrics.json")
 
 
 def _plot(pred: torch.Tensor, gt: torch.Tensor, out_dir: Path, k: int,
@@ -355,12 +370,12 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
-    ap.add_argument("--cond-modality", default="all",
-                    choices=["all", "ecg_ppg", "ecg", "ppg"],
-                    help="input direction(s) to evaluate. 'all' (default) = every "
-                         "direction the checkpoint trained on (unified -> 3, "
-                         "specialist -> 1); or pin one. Each appears under its name "
-                         "in metrics.json when more than one is evaluated.")
+    ap.add_argument("--task", default="all",
+                    choices=["all", *TASK_ORDER],
+                    help="task(s) to evaluate. 'all' (default) = EVERY task the "
+                         "checkpoint trained on (->ABP: clinical+waveform; ECG/PPG "
+                         "translation: waveform-only); or pin one. Each appears under "
+                         "its name in metrics.json when more than one is evaluated.")
     ap.add_argument("--num", type=int, default=-1, help="max segments (-1 = all)")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)

@@ -130,9 +130,11 @@ def evaluate(
 def format_report(report: Dict[str, dict]) -> str:
     w = report["waveform"]
     lines = [
-        f"Waveform: MAE={w['MAE']:.3f}  RMSE={w['RMSE']:.3f}  Pearson={w['Pearson']:.4f}  (mmHg)",
+        f"Waveform: MAE={w['MAE']:.3f}  RMSE={w['RMSE']:.3f}  Pearson={w['Pearson']:.4f}",
     ]
     for key in ("SBP", "DBP", "MAP"):
+        if key not in report:  # waveform-only report (e.g. an ECG/PPG translation target)
+            continue
         a = report[key]["AAMI"]
         b = report[key]["BHS"]
         lines.append(

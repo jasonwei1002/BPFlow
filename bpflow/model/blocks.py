@@ -9,12 +9,13 @@ rotary phase. When ``pre_only=True`` the condition streams contribute to the
 joint attention but are not themselves updated (used for the final joint layer).
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from ._wavflow_layers import MMDitSingleBlock, attention
+from ._wavflow_layers import MMDitSingleBlock
+from .attention_mask import masked_attention
 
 
 class BPJointBlock(nn.Module):
@@ -38,6 +39,7 @@ class BPJointBlock(nn.Module):
         ppg: torch.Tensor,
         c: torch.Tensor,
         rot: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x_qkv, x_mod = self.latent_block.pre_attention(latent, c, rot)
         e_qkv, e_mod = self.ecg_block.pre_attention(ecg, c, rot)
@@ -45,7 +47,9 @@ class BPJointBlock(nn.Module):
 
         ll, el = latent.shape[1], ecg.shape[1]
         joint_qkv = [torch.cat([x_qkv[i], e_qkv[i], p_qkv[i]], dim=2) for i in range(3)]
-        attn = attention(*joint_qkv)
+        # attn_mask=None -> identical to the vendored `attention`; a task mask routes
+        # condition->target token flow for the multi-target setup.
+        attn = masked_attention(*joint_qkv, attn_mask=attn_mask)
         x_out = attn[:, :ll]
         e_out = attn[:, ll : ll + el]
         p_out = attn[:, ll + el :]

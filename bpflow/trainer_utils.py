@@ -15,8 +15,6 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from .data import DEFAULT_MODALITY_DROPOUT_PROBS
-
 logger = logging.getLogger(__name__)
 
 
@@ -52,20 +50,15 @@ class DataConfig:
     abp_clip_low: float = 20.0
     abp_clip_high: float = 250.0
     cond_recenter: bool = True
-    # Conditioning modality (input "direction"): which signal(s) drive ABP.
-    # "ecg_ppg" (default) = both; "ecg" = ECG only (PPG masked to 0); "ppg" =
-    # PPG only. Masking keeps the architecture / params / checkpoint shape
-    # identical across directions; train and infer MUST use the same value.
-    cond_modality: str = "ecg_ppg"
-    # Per-sample modality dropout (TRAIN split only) — trains ONE unified model
-    # that handles ecg_ppg / ecg / ppg inputs. Each training sample randomly
-    # picks a modality (others masked, same as cond_modality); val/test/infer
-    # keep the fixed cond_modality above. Probs are [ecg_ppg, ecg, ppg], biased
-    # to the joint case by default. Off → fixed cond_modality everywhere.
-    modality_dropout: bool = False
-    modality_dropout_probs: List[float] = field(
-        default_factory=lambda: list(DEFAULT_MODALITY_DROPOUT_PROBS)
-    )
+    # Multi-target task system. ``tasks`` = the subset of named (cond->target) tasks
+    # the model trains on; empty = all five (ecg_ppg2abp, ecg2abp, ppg2abp,
+    # ppg2ecg, ecg2ppg). ``task_probs`` = the per-sample TRAIN draw distribution
+    # aligned to ``tasks`` (empty = uniform). ``eval_task`` = the single fixed task
+    # val/test/infer use (empty = the first ->ABP task in the set). Valid names: the
+    # keys of data.TASK_SPEC. A single-task ``tasks`` list = a specialist.
+    tasks: List[str] = field(default_factory=list)
+    task_probs: List[float] = field(default_factory=list)
+    eval_task: str = ""
     # Clinical-metric TRUE source for infer.py. "waveform" = derive SBP/DBP/MAP
     # per-beat from the true ABP wave (no CSV, no definitional offset); "csv" =
     # the CSV cuff [sbp, dbp, map] label; "both" = report both side by side. PRED
@@ -141,9 +134,9 @@ class TrainingConfig:
     # that still covers all subjects, fixed across epochs so the MAE trend stays
     # comparable. Applied before the DDP shard; the single val-subsampling knob.
     val_eval_fraction: float = 1.0
-    # Monitor-only: per-modality flow-matching loss on val (ecg_ppg/ecg/ppg),
-    # logged as val/loss_<modality> (fixed seed → epochs comparable). Useful to
-    # watch a unified (modality_dropout) model. -1 = full val, 0 = off,
+    # Monitor-only: per-task flow-matching loss on val (every trained task),
+    # logged as val/loss_<task> (fixed seed → epochs comparable). Useful to watch a
+    # multi-task model (incl. ECG↔PPG translation). -1 = full val, 0 = off,
     # N > 0 = cap batches PER RANK.
     val_loss_max_batches: int = 50
     ema_decay: float = 0.9999
@@ -237,10 +230,11 @@ def drop_legacy_keys(state: dict) -> dict:
 
 
 # Prefixes of params ADDED after some checkpoints were saved. They are allowed to
-# be MISSING on load (kept at fresh init) — e.g. loading a pre-null-token model
-# for finetune — without masking a genuine architecture mismatch.
-#   null_ecg / null_ppg — learned "modality absent" tokens (cond_mask)
-_NEW_OPTIONAL_PREFIXES = ("null_ecg", "null_ppg")
+# be MISSING on load (kept at fresh init) without masking a genuine architecture
+# mismatch. Empty for the multi-target architecture — it is a clean break (old
+# single-target checkpoints are incompatible by shape), so any compatible
+# checkpoint carries the full param set. Add a prefix here for future additions.
+_NEW_OPTIONAL_PREFIXES: tuple = ()
 
 
 def load_model_state(model: torch.nn.Module, state: dict) -> None:
