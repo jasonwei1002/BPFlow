@@ -25,6 +25,7 @@ import torch.nn.functional as F
 NUM_STREAMS = 3  # concatenated joint order: 0 = ABP, 1 = ECG, 2 = PPG
 
 
+@torch.compiler.disable
 def masked_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -35,17 +36,20 @@ def masked_attention(
 
     Mirrors the vendored kernel exactly (the contiguous() calls work around a
     cuDNN limitation, see the vendor note) but forwards ``attn_mask`` to SDPA.
+
+    Runs EAGER under ``@torch.compiler.disable``: with an additive float mask, the
+    SDPA output + head-merge view trips torch.compile's AOTAutograd alias
+    reconstruction ("Cannot view a tensor ... as ..."), crashing the compiled
+    multi-GPU forward at the first joint block. SDPA is already a single fused
+    kernel, so running attention eagerly costs ~nothing; the rest of the block
+    (norms, AdaLN, FFN, projections) still compiles. A graph break here is benign
+    under DDPOptimizer. Verified correct in eager by the CPU smoke test.
     """
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
     out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    # Merge heads: (B, H, N, D) -> (B, N, H*D). An additive (float) attn_mask makes
-    # SDPA pick the mem-efficient/math kernel, whose output can carry a non-standard
-    # stride layout; einops' rearrange then traces as a non-viewable reshape that
-    # torch.compile's AOTAutograd alias reconstruction rejects ("Cannot view a
-    # tensor ... as ..."). Forcing a contiguous (B, N, H, D) BEFORE the head-merge
-    # view keeps it a legitimate view under compile. Eager is unaffected.
+    # merge heads: (B, H, N, D) -> (B, N, H*D), contiguous before the view
     b, h, n, d = out.shape
     out = out.transpose(1, 2).contiguous().view(b, n, h * d)
     return out
