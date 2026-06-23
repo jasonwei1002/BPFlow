@@ -59,11 +59,6 @@ class DataConfig:
     tasks: List[str] = field(default_factory=list)
     task_probs: List[float] = field(default_factory=list)
     eval_task: str = ""
-    # Clinical-metric TRUE source for infer.py. "waveform" = derive SBP/DBP/MAP
-    # per-beat from the true ABP wave (no CSV, no definitional offset); "csv" =
-    # the CSV cuff [sbp, dbp, map] label; "both" = report both side by side. PRED
-    # is always per-beat from the generated wave. (Trainer val/test stay waveform.)
-    eval_true_source: str = "waveform"
     # Train/val split. "segment" = random per-segment (leaks subjects across
     # train/val → optimistic val); "subject" = subject-disjoint via CSV
     # subject_id (honest val, matches the CalFree test setting).

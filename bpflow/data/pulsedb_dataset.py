@@ -34,7 +34,6 @@ from .transforms import (
 log = logging.getLogger(__name__)
 
 _DEMO_COLS = ["age", "gender", "height", "weight", "bmi"]
-_BP_COLS = ["sbp", "dbp", "map"]  # CSV cuff label -> optional clinical TRUE for eval
 # Multi-target task system. Stream / target index order: 0=ABP, 1=ECG, 2=PPG.
 TARGET_ORDER = ("abp", "ecg", "ppg")
 # task name -> (target_idx, cond_present over [abp, ecg, ppg]). A target is never
@@ -124,7 +123,6 @@ class PulseDBDataset(Dataset):
         eval_task: Optional[str] = None,
         use_demo: bool = False,
         demo_consts: Optional[Dict[str, float]] = None,
-        eval_true_source: str = "waveform",
         finetune: bool = False,
         finetune_val_fraction: float = 0.1,
         finetune_test_fraction: float = 0.1,
@@ -153,17 +151,15 @@ class PulseDBDataset(Dataset):
             raise ValueError(f"expected (N,3,L) array at {npy_path}, got {self.arr.shape}")
         total = self.arr.shape[0]
 
-        # Read the sibling CSV once if subject-split / demographics / CSV BP labels
-        # need it. Non-finetune subject split needs it for train/val; finetune
-        # needs it (all splits) only in the per-subject `stratified` mode. CSV BP
-        # is an eval TRUE used by infer, so only val/test load it.
+        # Read the sibling CSV once if subject-split / demographics need it.
+        # Non-finetune subject split needs it for train/val; finetune needs it
+        # (all splits) only in the per-subject `stratified` mode.
         need_subject = (not finetune) and split in ("train", "val") and split_mode == "subject"
         need_finetune_subj = finetune and finetune_split_mode == "stratified"
         needs_subject_col = need_subject or need_finetune_subj
-        need_bp = eval_true_source in ("csv", "both") and split in ("val", "test")
         frame = None
-        if needs_subject_col or use_demo or need_bp:
-            frame = self._read_csv(npy_path, total, needs_subject_col, use_demo, need_bp)
+        if needs_subject_col or use_demo:
+            frame = self._read_csv(npy_path, total, needs_subject_col, use_demo)
 
         if finetune and finetune_split_mode == "stratified":
             assert frame is not None  # need_finetune_subj forced the CSV read above
@@ -213,12 +209,6 @@ class PulseDBDataset(Dataset):
             assert frame is not None
             self._build_demo(frame, demo_consts or {})
 
-        self.bp_true = None
-        if need_bp:
-            assert frame is not None
-            bp = np.stack([frame[c].to_numpy(dtype=np.float32) for c in _BP_COLS], axis=1)
-            self.bp_true = torch.from_numpy(bp[self.indices])  # (n, 3) [SBP, DBP, MAP] mmHg
-
         if finetune:
             mode = f"finetune-3way-{finetune_split_mode}"
             if split == "train" and finetune_train_ratio < 1.0:
@@ -233,22 +223,18 @@ class PulseDBDataset(Dataset):
 
     # -- setup helpers -----------------------------------------------------
     @staticmethod
-    def _read_csv(npy_path: str, total: int, need_subject: bool, use_demo: bool,
-                  need_bp: bool = False):
+    def _read_csv(npy_path: str, total: int, need_subject: bool, use_demo: bool):
         import pandas as pd
 
         csv_path = _csv_path_for(npy_path)
         if not os.path.exists(csv_path):
             raise FileNotFoundError(
-                f"need {csv_path} for subject-split/demographics/CSV-BP truth, but it "
-                "is missing. Use split_mode='segment', use_demo=false, "
-                "eval_true_source='waveform', or provide the CSV."
+                f"need {csv_path} for subject-split/demographics, but it is missing. "
+                "Use split_mode='segment' and use_demo=false, or provide the CSV."
             )
         cols = ["subject_id"] if need_subject else []
         if use_demo:
             cols += _DEMO_COLS
-        if need_bp:
-            cols += _BP_COLS
         frame = pd.read_csv(csv_path, usecols=cols)
         if len(frame) != total:
             raise ValueError(
@@ -409,8 +395,6 @@ class PulseDBDataset(Dataset):
             "cond_present": torch.tensor(cond_present, dtype=torch.float32),  # (3,) [abp,ecg,ppg]
             "abp_raw": abp,  # ground-truth mmHg waveform for eval (unclipped)
         }
-        if self.bp_true is not None:
-            out["bp_true"] = self.bp_true[i]  # (3,) CSV cuff [SBP, DBP, MAP] mmHg
         if self.use_demo:
             assert self.demo_cont is not None and self.demo_gender is not None
             out["demo_cont"] = self.demo_cont[i]      # (5,)
@@ -453,7 +437,6 @@ def build_dataset(cfg, split: str) -> PulseDBDataset:
         eval_task=(str(d.eval_task) if getattr(d, "eval_task", None) else None),
         use_demo=bool(cfg.model.use_demo),
         demo_consts=demo_consts,
-        eval_true_source=str(getattr(d, "eval_true_source", "waveform")),
         finetune=finetune,
         finetune_val_fraction=float(getattr(d, "finetune_val_fraction", 0.1)),
         finetune_test_fraction=float(getattr(d, "finetune_test_fraction", 0.1)),

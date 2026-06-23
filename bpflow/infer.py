@@ -68,29 +68,17 @@ def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) ->
     return trained
 
 
-def _build_reports(pred, gt, bp, source: str, target_idx: int) -> dict:
-    """Reports for one task's gathered predictions.
+def _build_report(pred, gt, target_idx: int) -> dict:
+    """Report for one task's gathered predictions.
 
-    For an ABP target (``target_idx == 0``): clinical + waveform, with ``source``
-    (waveform/csv/both) picking the BP TRUE — per-beat on the true wave
-    (``true_waveform``) and/or the CSV cuff label (``true_csv``). For an ECG/PPG
+    ABP target (``target_idx == 0``): clinical + waveform metrics, with SBP/DBP/MAP
+    derived per-beat from the true ABP wave (no definitional offset). ECG/PPG
     translation target: waveform-only (MAE/RMSE/Pearson in normalized [0,1] units;
-    clinical BP metrics and the CSV cuff don't apply).
+    clinical BP metrics don't apply).
     """
     if target_idx != 0:  # ECG / PPG translation target -> waveform fidelity only
-        return {"true_waveform": {"waveform": waveform_metrics(pred, gt)}}
-    true_bp = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]} if bp is not None else None
-    if source in ("csv", "both") and true_bp is None:
-        raise RuntimeError(
-            f"eval_true_source={source!r} needs the CSV cuff label but no bp_true was "
-            "loaded (is the sibling CSV present and data.eval_true_source set?)."
-        )
-    reports: dict = {}
-    if source in ("waveform", "both"):
-        reports["true_waveform"] = evaluate(pred, gt)
-    if source in ("csv", "both"):
-        reports["true_csv"] = evaluate(pred, gt, true_bp)
-    return reports
+        return {"waveform": waveform_metrics(pred, gt)}
+    return evaluate(pred, gt)
 
 
 @torch.no_grad()
@@ -105,8 +93,7 @@ def _sample_and_gather(task, loader, model, fm, gen, device, cfg, seed,
     recentered ECG/PPG patches un-patchified + un-recentered otherwise). Re-seeds the
     generator so every task sees identical initial noise → a paired comparison. ALL
     ranks must call this together — the all_gather is a collective. Returns
-    ``(pred, gt, bp)`` on rank 0 (cuff ``bp`` is None for non-ABP / no-CSV);
-    ``(None, None, None)`` on other ranks.
+    ``(pred, gt)`` on rank 0; ``(None, None)`` on other ranks.
     """
     gen.manual_seed(seed)  # same noise across tasks → paired comparison
     tidx, cp = TASK_SPEC[task]
@@ -115,7 +102,7 @@ def _sample_and_gather(task, loader, model, fm, gen, device, cfg, seed,
     abp_mean, abp_std = float(cfg.data.abp_mean), float(cfg.data.abp_std)
     cond_recenter = bool(cfg.data.cond_recenter)
     shift = 0.5 if cond_recenter else 0.0  # un-recenter ECG/PPG ground truth
-    preds, gts, bps = [], [], []
+    preds, gts = [], []
     tag = f"infer:{task} (rank0 shard of {total})" if distributed else f"infer:{task} ({total})"
     for batch in tqdm(loader, desc=tag, disable=not is_main):
         demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
@@ -129,40 +116,31 @@ def _sample_and_gather(task, loader, model, fm, gen, device, cfg, seed,
         preds.append(out.cpu())
         if tidx == 0:
             gts.append(batch["abp_raw"].cpu())
-            if "bp_true" in batch:  # CSV cuff [SBP, DBP, MAP] -> clinical TRUE (ABP only)
-                bps.append(batch["bp_true"].cpu())
         else:  # ECG/PPG target: clean wave = un-patchify the recentered patches + shift
             key = "ecg_patches" if tidx == 1 else "ppg_patches"
             gts.append((unpatchify(batch[key]) + shift).cpu())
     pred = torch.cat(preds, dim=0) if preds else None
     gt = torch.cat(gts, dim=0) if gts else None
-    bp = torch.cat(bps, dim=0) if bps else None
 
     if distributed:
         import torch.distributed as dist
 
         gathered: list = [None] * world_size
-        dist.all_gather_object(gathered, (pred, gt, bp))
+        dist.all_gather_object(gathered, (pred, gt))
         dist.barrier()
         if not is_main:
-            return None, None, None
-        pred_parts = [p for p, _, _ in gathered if p is not None]
-        gt_parts = [g for _, g, _ in gathered if g is not None]
-        bp_parts = [b for _, _, b in gathered if b is not None]
+            return None, None
+        pred_parts = [p for p, _ in gathered if p is not None]
+        gt_parts = [g for _, g in gathered if g is not None]
         pred = torch.cat(pred_parts, dim=0) if pred_parts else None  # None if every shard empty
         gt = torch.cat(gt_parts, dim=0) if gt_parts else None
-        bp = torch.cat(bp_parts, dim=0) if bp_parts else None
-    return pred, gt, bp
+    return pred, gt
 
 
 @torch.no_grad()
 def run_inference(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     cfg = load_config(args.config)
-    # --true-source overrides the config so the dataset loads the CSV cuff label
-    # (bp_true) and the report uses the same source.
-    if args.true_source is not None:
-        cfg.data.eval_true_source = args.true_source
 
     # Distributed (single-node multi-GPU via torchrun). When WORLD_SIZE == 1 this
     # is identical to the old single-process path.
@@ -219,26 +197,23 @@ def run_inference(args: argparse.Namespace) -> None:
     # late/asymmetric raise inside the task loop would deadlock DDP.
     if not tasks_to_eval:
         raise ValueError(f"no trained tasks to evaluate (trained={sorted(trained)})")
-    source = str(args.true_source or cfg.data.eval_true_source)
-    if source not in ("waveform", "csv", "both"):
-        raise ValueError(f"eval_true_source must be waveform/csv/both, got {source!r}")
 
     out_dir = Path(args.out)
     multi = len(tasks_to_eval) > 1
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("evaluating tasks %s [true=%s]", tasks_to_eval, source)
+        logger.info("evaluating tasks %s", tasks_to_eval)
 
     # Every rank must enter _sample_and_gather for EVERY task (its all_gather is a
     # collective). So rank-0-only reporting is wrapped in try/except and the first
     # error is DEFERRED: the loop keeps running (all collectives complete), the group
     # is torn down, and only then is the error re-raised — a reporting failure (e.g.
-    # missing CSV under --true-source csv) can never strand the other ranks mid-loop.
+    # an empty shard) can never strand the other ranks mid-loop.
     results: dict = {}
     deferred_error = None
     for t in tasks_to_eval:
         target_idx = TASK_SPEC[t][0]
-        pred, gt, bp = _sample_and_gather(
+        pred, gt = _sample_and_gather(
             t, loader, model, fm, gen, device, cfg, args.seed,
             distributed, world_size, is_main, total,
         )
@@ -247,11 +222,10 @@ def run_inference(args: argparse.Namespace) -> None:
         try:
             if pred is None:
                 raise RuntimeError(f"no segments evaluated for task {t!r}")
-            reports = _build_reports(pred, gt, bp, source, target_idx)
-            results[t] = next(iter(reports.values())) if len(reports) == 1 else reports
+            report = _build_report(pred, gt, target_idx)
+            results[t] = report
             logger.info("[%s] %d segments across %d process(es)", t, pred.shape[0], world_size)
-            for name, rep in reports.items():
-                logger.info("[%s/%s]\n%s", t, name, format_report(rep))
+            logger.info("[%s]\n%s", t, format_report(report))
             suffix = f"_{t}" if multi else ""
             arrow = _arrow(t)
             if args.save_waveforms:
@@ -265,14 +239,8 @@ def run_inference(args: argparse.Namespace) -> None:
             # Bland-Altman is BP-beat agreement -> ABP-target tasks only (segment_bp
             # is meaningless on an ECG/PPG waveform).
             if args.bland_altman and target_idx == 0:
-                pred_bp = segment_bp(pred)  # computed once, reused across truth sources
-                if source in ("waveform", "both"):
-                    _bland_altman(pred_bp, segment_bp(gt), out_dir, f"waveform{suffix}",
-                                  title=f"{arrow}  (waveform truth)")
-                if source in ("csv", "both"):  # bp guaranteed non-None by _build_reports
-                    true_csv = {"SBP": bp[:, 0], "DBP": bp[:, 1], "MAP": bp[:, 2]}
-                    _bland_altman(pred_bp, true_csv, out_dir, f"csv{suffix}",
-                                  title=f"{arrow}  (cuff truth)")
+                _bland_altman(segment_bp(pred), segment_bp(gt), out_dir, f"waveform{suffix}",
+                              title=f"{arrow}  (waveform truth)")
         except Exception as e:  # noqa: BLE001 — defer until all collectives are done
             deferred_error = deferred_error or e
 
@@ -322,9 +290,9 @@ def _bland_altman(pred_bp: dict, true_bp: dict, out_dir: Path, name: str,
     """3-panel (SBP/DBP/MAP) Bland-Altman agreement plot.
 
     Per BP value: x = (pred+true)/2, y = pred-true; horizontal lines mark the bias
-    (mean diff) and the 95% limits of agreement (bias +/- 1.96 SD). ``name`` is the
-    truth source + modality suffix, e.g. ``waveform`` / ``csv_ecg``; ``title`` is the
-    figure suptitle (e.g. "ECG+PPG -> ABP  (cuff truth)").
+    (mean diff) and the 95% limits of agreement (bias +/- 1.96 SD). ``name`` is a
+    filename suffix (e.g. ``waveform`` or ``waveform_ppg2abp``); ``title`` is the
+    figure suptitle (e.g. "ECG+PPG -> ABP  (waveform truth)").
     """
     try:
         import matplotlib
@@ -380,9 +348,6 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--use-ema", action="store_true")
-    ap.add_argument("--true-source", default=None, choices=["waveform", "csv", "both"],
-                    help="clinical TRUE source (default: data.eval_true_source). "
-                         "waveform=per-beat on true wave; csv=cuff label; both=report both")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=14159265)
     ap.add_argument("--out", default="output/infer")

@@ -4,7 +4,7 @@
 # finetune.yaml's use_demo:false would RuntimeError on such a checkpoint.
 #
 # Use it to finetune a w-demo pretrain on CalFree (stratified 8:1:1, auto-tests
-# the held-out 10% at the end -> test/* + test/cuff_*):
+# the held-out 10% at the end -> test/*):
 #   bash finetune.sh output/<w_demo_pretrain_ts>/checkpoint_best.pth \
 #     --config bpflow/config/finetune_demo.yaml
 #   # or direct:

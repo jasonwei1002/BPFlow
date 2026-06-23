@@ -37,11 +37,6 @@ data:
   tasks: [ecg_ppg2abp, ecg2abp, ppg2abp, ppg2ecg, ecg2ppg]
   task_probs: [0.30, 0.20, 0.20, 0.15, 0.15]
   eval_task: ""
-  # clinical-metric TRUE source for infer.py (pred is always per-beat from the
-  # generated wave): waveform = per-beat on the true ABP wave (no CSV, no
-  # definitional offset) | csv = the CSV cuff [sbp,dbp,map] label | both = report
-  # both side by side. csv/both need the sibling CSV. Override per-run: infer --true-source.
-  eval_true_source: waveform
   # demographic z-score constants (full train split, non-NaN); used when model.use_demo
   demo_age_mean: 61.11
   demo_age_std: 15.10

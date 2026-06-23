@@ -18,7 +18,7 @@ generated (PRED) and the true waveform go through the same extractor, so the
 SBP/DBP comparison carries no definitional bias (a perfect reconstruction scores 0).
 """
 
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
@@ -106,19 +106,16 @@ def bhs(pred_vals: torch.Tensor, true_vals: torch.Tensor) -> Dict[str, object]:
 def evaluate(
     pred_mmhg: torch.Tensor,
     true_mmhg: torch.Tensor,
-    true_bp: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, dict]:
     """Full report. pred/true waveforms: (B, L) mmHg.
 
-    PRED SBP/DBP/MAP are always per-beat from the generated waveform. The clinical
-    TRUE is per-beat from the true waveform by default (no definitional offset), or
-    the caller-supplied ``true_bp`` (per-segment {SBP, DBP, MAP} mmHg, e.g. the CSV
-    cuff label) when given.
+    Both PRED and TRUE SBP/DBP/MAP are per-beat from their respective waveforms
+    (the same extractor on both → no definitional offset, a perfect reconstruction
+    scores 0).
     """
     report: Dict[str, dict] = {"waveform": waveform_metrics(pred_mmhg, true_mmhg)}
     pred_bp = segment_bp(pred_mmhg)
-    if true_bp is None:
-        true_bp = segment_bp(true_mmhg)
+    true_bp = segment_bp(true_mmhg)
     for key in ("SBP", "DBP", "MAP"):
         report[key] = {
             "AAMI": aami(pred_bp[key], true_bp[key]),

@@ -56,7 +56,7 @@ training:
                               # its all_gather is swallowed by _maybe_run_test's
                               # try/except -> surviving ranks hang -> CRASHED, losing
                               # the run). Score the held-out 10% test separately and
-                              # safely with: bash infer.sh <ckpt> --nproc 1 --true-source both
-                              # (single-process, no collective, dual BP truth).
+                              # safely with: bash infer.sh <ckpt> --nproc 1
+                              # (single-process, no collective).
   test_max_segments: -1      # all test-split segments (DDP-sharded; -1 = all)
   # init_from_ckpt is supplied at launch via finetune.sh / --init-ckpt

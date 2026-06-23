@@ -266,23 +266,17 @@ class Trainer:
     def _flat_report(report: dict, prefix: str = "val") -> dict:
         """Flatten the eval report into scalar metrics for logging (val/ or test/).
 
-        Top-level SBP/DBP/MAP → ``{prefix}/{key}_*`` (waveform-truth). A ``cuff``
-        block, when present (post-train test with the CSV label), → a parallel
-        ``{prefix}/cuff_{key}_*`` so both truth sources are logged separately.
+        Top-level SBP/DBP/MAP → ``{prefix}/{key}_*`` (waveform-truth).
         """
         out = {f"{prefix}/{k}": float(v) for k, v in report["waveform"].items()}
-        sources = [("", report)]
-        if "cuff" in report:
-            sources.append(("cuff_", report["cuff"]))
-        for infix, rep in sources:
-            for key in ("SBP", "DBP", "MAP"):
-                if key not in rep:  # waveform-only report (an ECG/PPG translation task)
-                    continue
-                a, b = rep[key]["AAMI"], rep[key]["BHS"]
-                out[f"{prefix}/{infix}{key}_ME"] = float(a["ME"])
-                out[f"{prefix}/{infix}{key}_SDE"] = float(a["SDE"])
-                out[f"{prefix}/{infix}{key}_AAMI_pass"] = float(a["pass"])
-                out[f"{prefix}/{infix}{key}_within5mmHg"] = float(b["<=5mmHg"])
+        for key in ("SBP", "DBP", "MAP"):
+            if key not in report:  # waveform-only report (an ECG/PPG translation task)
+                continue
+            a, b = report[key]["AAMI"], report[key]["BHS"]
+            out[f"{prefix}/{key}_ME"] = float(a["ME"])
+            out[f"{prefix}/{key}_SDE"] = float(a["SDE"])
+            out[f"{prefix}/{key}_AAMI_pass"] = float(a["pass"])
+            out[f"{prefix}/{key}_within5mmHg"] = float(b["<=5mmHg"])
         return out
 
     def _autocast(self):
@@ -599,7 +593,7 @@ class Trainer:
         # Single TARGET modality for this call (validate() always passes a task;
         # None = ABP-from-batch for back-compat). ABP target → waveform + clinical
         # BP cols; ECG/PPG translation target → waveform-only (segment_bp is
-        # meaningless on ECG/PPG). `*_t` = waveform-truth BP; `*_c` = CSV cuff label.
+        # meaningless on ECG/PPG). `*_p` = pred BP; `*_t` = waveform-truth BP.
         if task_override is not None:
             tgt_idx, cp = TASK_SPEC[task_override]
         else:
@@ -607,7 +601,7 @@ class Trainer:
         is_abp = tgt_idx == 0
         shift = 0.5 if bool(self.cfg.data.cond_recenter) else 0.0  # un-recenter ECG/PPG gt
         keys = ("ae", "se", "r") + (
-            ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t", "sbp_c", "dbp_c", "map_c")
+            ("sbp_p", "dbp_p", "map_p", "sbp_t", "dbp_t", "map_t")
             if is_abp else ()
         )
         cols: dict = {k: [] for k in keys}
@@ -637,13 +631,10 @@ class Trainer:
                 pbp, tbp = segment_bp(pred), segment_bp(gt)
                 cols["sbp_p"].append(pbp["SBP"]); cols["dbp_p"].append(pbp["DBP"]); cols["map_p"].append(pbp["MAP"])
                 cols["sbp_t"].append(tbp["SBP"]); cols["dbp_t"].append(tbp["DBP"]); cols["map_t"].append(tbp["MAP"])
-                cuff = batch.get("bp_true")  # (b, 3) [SBP, DBP, MAP] cuff label, or None
-                if cuff is not None:
-                    cols["sbp_c"].append(cuff[:, 0]); cols["dbp_c"].append(cuff[:, 1]); cols["map_c"].append(cuff[:, 2])
         if was_training:
             self.model_raw.train()
-        # Drop empty cuff cols when no bp_true was present → gathered dict keys stay
-        # consistent across ranks (all ranks share the same config).
+        # Either every BP col is populated (ABP target) or none (waveform-only
+        # target) → gathered dict keys stay consistent across ranks.
         local = {k: torch.cat(v) for k, v in cols.items() if v} if cols["ae"] else None
 
         if self.distributed:
@@ -672,8 +663,7 @@ class Trainer:
         mean-of-per-segment-means equals the global mean; same for MSE). Pearson is
         the per-segment-r mean, matching ``waveform_metrics``. Top-level SBP/DBP/MAP
         are the waveform-truth clinical metrics (PRED per-beat vs the true wave's
-        per-beat). When the CSV cuff label was gathered (``*_c`` present), a parallel
-        ``cuff`` block reports the same clinical metrics against the cuff label.
+        per-beat).
         """
         report = {"waveform": {
             "MAE": m["ae"].mean().item(),
@@ -686,12 +676,6 @@ class Trainer:
         true_bp = {"SBP": m["sbp_t"], "DBP": m["dbp_t"], "MAP": m["map_t"]}
         for key in ("SBP", "DBP", "MAP"):
             report[key] = {"AAMI": aami(pred_bp[key], true_bp[key]), "BHS": bhs(pred_bp[key], true_bp[key])}
-        if "sbp_c" in m:
-            cuff_bp = {"SBP": m["sbp_c"], "DBP": m["dbp_c"], "MAP": m["map_c"]}
-            report["cuff"] = {
-                key: {"AAMI": aami(pred_bp[key], cuff_bp[key]), "BHS": bhs(pred_bp[key], cuff_bp[key])}
-                for key in ("SBP", "DBP", "MAP")
-            }
         return report
 
     def _active_tasks(self) -> list:
@@ -841,20 +825,10 @@ class Trainer:
     def run_test(self, epoch: int) -> None:
         """Evaluate the best-by-val (EMA) model on CalFree test; log + save metrics.
 
-        Forces BOTH clinical truth sources: PRED per-beat is scored against the
-        true-wave per-beat (test/*) AND, when the sibling CSV is present, the CSV
-        cuff label (test/cuff_*) — logged separately. Falls back to waveform-truth
-        only if the CSV is genuinely absent.
+        PRED per-beat SBP/DBP/MAP are scored against the true ABP wave's per-beat
+        values (test/*) — the same extractor on both, so no definitional offset.
         """
-        # Override eval_true_source to "both" so the dataset loads the cuff label;
-        # _distributed_eval then auto-reports the parallel cuff clinical block.
-        cfg_test = OmegaConf.create(OmegaConf.to_container(self.cfg, resolve=True))
-        cfg_test.data.eval_true_source = "both"
-        try:
-            test_ds = build_dataset(cfg_test, "test")
-        except FileNotFoundError:
-            logger.warning("CSV cuff label not found; post-train test runs waveform-truth only")
-            test_ds = build_dataset(self.cfg, "test")
+        test_ds = build_dataset(self.cfg, "test")
         total = len(test_ds)
         max_seg = int(self.cfg.training.test_max_segments)
         if 0 < max_seg < total:
@@ -874,9 +848,6 @@ class Trainer:
             return
         logger.info("[test] %d segments (weights=%s) — clinical vs true wave\n%s",
                     total, src, format_report(report))
-        if "cuff" in report:
-            logger.info("[test] clinical vs CSV cuff\n%s",
-                        format_report({"waveform": report["waveform"], **report["cuff"]}))
         self._sw_log(self._flat_report(report, "test"), epoch)  # epoch axis, like val/*
         path = os.path.join(self.exp_dir, "test_metrics.json")
         with open(path, "w") as f:
