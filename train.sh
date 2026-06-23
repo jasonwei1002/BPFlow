@@ -6,7 +6,7 @@
 #   N GPUs:                      bash train.sh --nproc 4
 #   pick GPUs:                   CUDA_VISIBLE_DEVICES=0,1 bash train.sh --nproc 2
 #   override config / args:      bash train.sh --config bpflow/config/other.yaml
-#   override a config field:     bash train.sh training.lr=1e-4 model.use_demo=true
+#   override a config field:     bash train.sh training.lr=1e-4 'data.task_probs=[0.3,0.2,0.2,0.15,0.15]'
 #   resume an interrupted run:   bash train.sh --resume output/<YYYYMMDD_HHMMSS>
 
 # ECG单模态训练命令

@@ -30,7 +30,6 @@ class ModelConfig:
     depth: int = 12
     mlp_ratio: float = 4.0
     joint_depth: int = 8  # number of 3-stream (ABP+ECG+PPG) joint-attention layers
-    use_demo: bool = False  # condition on demographics (age/gender/height/weight/bmi)
 
 
 @dataclass
@@ -63,17 +62,6 @@ class DataConfig:
     # train/val → optimistic val); "subject" = subject-disjoint via CSV
     # subject_id (honest val, matches the CalFree test setting).
     split_mode: str = "segment"
-    # Demographic z-score constants from the full train split (non-NaN); used
-    # only when model.use_demo is true. height/weight/bmi are ~48% missing →
-    # carried with a missing flag, NaN→0 (see standardize_demo).
-    demo_age_mean: float = 61.11
-    demo_age_std: float = 15.10
-    demo_height_mean: float = 162.50
-    demo_height_std: float = 9.64
-    demo_weight_mean: float = 60.82
-    demo_weight_std: float = 11.66
-    demo_bmi_mean: float = 22.92
-    demo_bmi_std: float = 3.44
     # Finetune mode: ignore train_npy/split_mode and instead split the CalFree
     # `test_npy` into train/val/test by a fixed-seed per-segment partition
     # (8:1:1 by default). Used by the finetune flow to adapt a pretrained model
@@ -216,7 +204,8 @@ def load_config(config_path: Optional[str] = None, overrides: Optional[dict] = N
 # strip them on load. Anything else stays, so a real mismatch still fails loudly.
 #   empty_*                      — classifier-free-guidance null conditions
 #   context_encoder.* / bp_head.* — ANIL/CAVIA per-subject context + cuff head
-_LEGACY_KEY_PREFIXES = ("empty_", "context_encoder.", "bp_head.")
+#   demo_encoder.*               — removed demographics global-prior encoder
+_LEGACY_KEY_PREFIXES = ("empty_", "context_encoder.", "bp_head.", "demo_encoder.")
 
 
 def drop_legacy_keys(state: dict) -> dict:

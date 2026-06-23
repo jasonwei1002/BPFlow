@@ -11,11 +11,10 @@ model:
   num_heads: 8
   depth: 12
   joint_depth: 8            # first 8 layers 3-stream joint; last 4 latent-only
-  use_demo: false           # demographics prior off this round (pure ECG/PPG -> ABP)
 
 data:
   split_mode: segment       # random per-segment train/val split (subjects shared across split)
-  # modality_dropout: true is now the base.yaml default (UNIFIED model) → inherited here.
+  # The UNIFIED multi-target task set is the base.yaml default → inherited here.
 
 training:
   epochs: 1000               # ceiling only; early_stop_patience + plateau decay end runs sooner

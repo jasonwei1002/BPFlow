@@ -299,21 +299,12 @@ class Trainer:
             ppg = ppg.repeat(rf, 1, 1)
             target_idx = target_idx.repeat(rf)
             cond_present = cond_present.repeat(rf, 1)
-        # Demographics ride along as a global prior (not a CFG-dropped condition).
-        demo = None
-        if bool(self.cfg.model.use_demo) and "demo_cont" in batch:
-            cont = batch["demo_cont"].to(self.device, non_blocking=True)
-            gender = batch["demo_gender"].to(self.device, non_blocking=True)
-            if rf > 1:
-                cont = cont.repeat(rf, 1)
-                gender = gender.repeat(rf)
-            demo = (cont, gender)
-        return abp, ecg, ppg, target_idx, cond_present, demo
+        return abp, ecg, ppg, target_idx, cond_present
 
     def _train_step(self, batch) -> dict:
         lr = adjust_learning_rate(self.optimizer, self.global_step, self.cfg, self.lr_scale)
         with self._autocast():
-            abp, ecg, ppg, target_idx, cond_present, demo = self._prepare_batch(batch)
+            abp, ecg, ppg, target_idx, cond_present = self._prepare_batch(batch)
             loss_vec = flow_matching_loss(
                 self.model, self.fm, abp, ecg, ppg, target_idx, cond_present,
                 generator=self.gen,
@@ -321,7 +312,6 @@ class Trainer:
                 logit_scale=float(self.cfg.sampling.logit_scale),
                 prediction_type=str(self.cfg.sampling.prediction_type),
                 loss_type=str(self.cfg.training.loss_type),
-                demo=demo,
                 per_sample=True,  # (B,) so we can decompose train loss by task
             )
             loss = loss_vec.mean()
@@ -523,19 +513,9 @@ class Trainer:
         self.best_val, self.epochs_no_improve, self.lr_scale, self.should_stop = obj
 
     # -- sampling ----------------------------------------------------------
-    def _batch_demo(self, batch):
-        """Pull a (cont, gender) demographics sample from a batch, or None.
-
-        Left on CPU; ``sample_target`` moves it to device. No repeat/drop here —
-        sampling uses the natural batch.
-        """
-        if not bool(self.cfg.model.use_demo) or "demo_cont" not in batch:
-            return None
-        return batch["demo_cont"], batch["demo_gender"]
-
     @torch.no_grad()
     def _sample_cond(
-        self, ecg_patches, ppg_patches, target_idx, cond_present, demo=None
+        self, ecg_patches, ppg_patches, target_idx, cond_present
     ) -> torch.Tensor:
         """Core sampler; assumes model is already in the desired eval/param state.
 
@@ -546,7 +526,6 @@ class Trainer:
             abp_mean=float(self.cfg.data.abp_mean), abp_std=float(self.cfg.data.abp_std),
             cond_recenter=bool(self.cfg.data.cond_recenter),
             autocast_ctx=self._autocast(),
-            demo=demo,
         )
 
     @contextlib.contextmanager
@@ -617,7 +596,6 @@ class Trainer:
                 cond_present = batch["cond_present"]
             pred = self._sample_cond(
                 batch["ecg_patches"], batch["ppg_patches"], target_idx, cond_present,
-                self._batch_demo(batch),
             )  # (b, L) target waveform on CPU
             if is_abp:
                 gt = batch["abp_raw"]
@@ -708,7 +686,6 @@ class Trainer:
         active = self._active_tasks()
         specs = [TASK_SPEC[t] for t in active]
         base_seed = int(self.cfg.training.seed)
-        use_demo = bool(self.cfg.model.use_demo)
         was_training = self.model_raw.training
         self.model_raw.eval()
         gen = torch.Generator(device=self.device)
@@ -721,9 +698,6 @@ class Trainer:
             ecg = batch["ecg_patches"].to(self.device, non_blocking=True)
             ppg = batch["ppg_patches"].to(self.device, non_blocking=True)
             bs = abp.shape[0]
-            demo = None
-            if use_demo and "demo_cont" in batch:
-                demo = (batch["demo_cont"].to(self.device), batch["demo_gender"].to(self.device))
             with self._autocast():
                 for i, (tidx, cp) in enumerate(specs):
                     gen.manual_seed(base_seed + bi)  # same noise/t across tasks & epochs
@@ -736,7 +710,6 @@ class Trainer:
                         logit_scale=float(self.cfg.sampling.logit_scale),
                         prediction_type=str(self.cfg.sampling.prediction_type),
                         loss_type=str(self.cfg.training.loss_type),
-                        demo=demo,
                     )
                     sums[i] += loss.detach().float() * bs  # fp32 like the train path
             n += bs

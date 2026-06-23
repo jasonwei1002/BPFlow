@@ -30,13 +30,6 @@ from .blocks import BPJointBlock
 
 log = logging.getLogger(__name__)
 
-# Continuous demographic channels [age, height, weight, bmi, body_missing_flag].
-# Must match data.transforms.DEMO_CONT_DIM (the dataset emits this layout).
-_DEMO_CONT_DIM = 5
-
-# A demographics sample: (continuous (B, 5), gender index (B,) long).
-DemoInput = Tuple[torch.Tensor, torch.Tensor]
-
 
 @dataclass
 class BPConditions:
@@ -53,26 +46,6 @@ class BPConditions:
     target_idx: torch.Tensor  # (B,) long
     pooled: torch.Tensor  # (B, hidden) global condition (present conditions only)
     attn_mask: torch.Tensor  # (B, 1, 3N, 3N) additive task-routing mask
-    demo_emb: Optional[torch.Tensor] = None  # (B, hidden) global demo prior, or None
-
-
-class DemoEncoder(nn.Module):
-    """Encode structured demographics into a global conditioning vector.
-
-    Continuous fields go through a linear map; gender (binary) through an
-    embedding; their sum is refined by an MLP. The final layer is zero-init so
-    demographics start as a no-op (global_c unchanged) and are learned in.
-    """
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.cont_proj = nn.Linear(_DEMO_CONT_DIM, hidden_dim)
-        self.gender_emb = nn.Embedding(2, hidden_dim)
-        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
-
-    def forward(self, cont: torch.Tensor, gender: torch.Tensor) -> torch.Tensor:
-        h = self.cont_proj(cont) + self.gender_emb(gender)  # (B, hidden)
-        return self.mlp(h)
 
 
 def _patch_embedder(in_dim: int, hidden: int, mlp_kernel: int) -> nn.Sequential:
@@ -102,7 +75,6 @@ class BPFlowModel(nn.Module):
         depth: int,
         joint_depth: int,
         mlp_ratio: float = 4.0,
-        use_demo: bool = False,
     ) -> None:
         super().__init__()
         if seq_len % patch_size != 0:
@@ -166,10 +138,6 @@ class BPFlowModel(nn.Module):
         )
         # per-modality flow-decode heads (the gathered target stream -> its flow).
         self.heads = nn.ModuleList([FinalBlock(hidden_dim, self.latent_dim) for _ in range(3)])
-        # optional demographic global-condition encoder (zero-init -> no-op start)
-        self.use_demo = use_demo
-        if use_demo:
-            self.demo_encoder = DemoEncoder(hidden_dim)
 
         self.initialize_weights()
         latent_rot = compute_rope_rotations(self.latent_seq_len, head_dim, 10000, device="cpu")
@@ -205,17 +173,6 @@ class BPFlowModel(nn.Module):
             nn.init.constant_(head.adaLN_modulation[-1].bias, 0)
             nn.init.constant_(head.conv.weight, 0)
             nn.init.constant_(head.conv.bias, 0)
-        if self.use_demo:
-            # zero-init the encoder output so demographics start as a no-op
-            nn.init.constant_(self.demo_encoder.mlp[-1].weight, 0)
-            nn.init.constant_(self.demo_encoder.mlp[-1].bias, 0)
-
-    def _demo_emb(self, demo: Optional[DemoInput]) -> Optional[torch.Tensor]:
-        """Encode a demographics sample, or None when demo conditioning is off."""
-        if not self.use_demo or demo is None:
-            return None
-        cont, gender = demo
-        return self.demo_encoder(cont, gender)  # (B, hidden)
 
     def preprocess_conditions(
         self,
@@ -223,7 +180,6 @@ class BPFlowModel(nn.Module):
         ppg_clean: torch.Tensor,
         target_idx: torch.Tensor,
         cond_present: torch.Tensor,
-        demo: Optional[DemoInput] = None,
     ) -> BPConditions:
         """Precompute the per-task pieces constant across ODE steps.
 
@@ -262,7 +218,6 @@ class BPFlowModel(nn.Module):
             target_idx=target_idx,
             pooled=pooled,
             attn_mask=attn_mask,
-            demo_emb=self._demo_emb(demo),
         )
 
     def predict_flow(
@@ -279,8 +234,6 @@ class BPFlowModel(nn.Module):
         ]
         latent, ecg, ppg = streams
         global_c = self.t_embed(t).unsqueeze(1) + conditions.pooled.unsqueeze(1)  # (B,1,H)
-        if conditions.demo_emb is not None:
-            global_c = global_c + conditions.demo_emb.unsqueeze(1)
         for block in self.joint_blocks:
             latent, ecg, ppg = block(latent, ecg, ppg, global_c, self.latent_rot, conditions.attn_mask)
         # gather the per-sample target stream, refine, decode with its head
@@ -303,12 +256,11 @@ class BPFlowModel(nn.Module):
         t: torch.Tensor,
         target_idx: torch.Tensor,
         cond_present: torch.Tensor,
-        demo: Optional[DemoInput] = None,
     ) -> torch.Tensor:
         return self.predict_flow(
             noised_target,
             t,
-            self.preprocess_conditions(ecg_clean, ppg_clean, target_idx, cond_present, demo),
+            self.preprocess_conditions(ecg_clean, ppg_clean, target_idx, cond_present),
         )
 
     def ode_wrapper(

@@ -98,20 +98,18 @@ def _sample_and_gather(task, loader, model, fm, gen, device, cfg, seed,
     gen.manual_seed(seed)  # same noise across tasks → paired comparison
     tidx, cp = TASK_SPEC[task]
     cp_row = torch.tensor(cp, dtype=torch.float32)
-    use_demo = bool(cfg.model.use_demo)
     abp_mean, abp_std = float(cfg.data.abp_mean), float(cfg.data.abp_std)
     cond_recenter = bool(cfg.data.cond_recenter)
     shift = 0.5 if cond_recenter else 0.0  # un-recenter ECG/PPG ground truth
     preds, gts = [], []
     tag = f"infer:{task} (rank0 shard of {total})" if distributed else f"infer:{task} ({total})"
     for batch in tqdm(loader, desc=tag, disable=not is_main):
-        demo = (batch["demo_cont"], batch["demo_gender"]) if use_demo and "demo_cont" in batch else None
         bs = batch["ecg_patches"].shape[0]
         out = sample_target(
             model, fm, batch["ecg_patches"], batch["ppg_patches"],
             torch.full((bs,), tidx, dtype=torch.long), cp_row.view(1, 3).repeat(bs, 1),
             generator=gen, device=device, abp_mean=abp_mean, abp_std=abp_std,
-            cond_recenter=cond_recenter, demo=demo,
+            cond_recenter=cond_recenter,
         )
         preds.append(out.cpu())
         if tidx == 0:

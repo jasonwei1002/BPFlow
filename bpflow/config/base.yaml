@@ -10,7 +10,6 @@ model:
   depth: 12
   mlp_ratio: 4.0
   joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
-  use_demo: false           # condition on demographics (age/gender/height/weight/bmi)
 
 data:
   train_npy: rawdata/pulsedb/Train_Subset.npy
@@ -37,15 +36,6 @@ data:
   tasks: [ecg_ppg2abp, ecg2abp, ppg2abp, ppg2ecg, ecg2ppg]
   task_probs: [0.30, 0.20, 0.20, 0.15, 0.15]
   eval_task: ""
-  # demographic z-score constants (full train split, non-NaN); used when model.use_demo
-  demo_age_mean: 61.11
-  demo_age_std: 15.10
-  demo_height_mean: 162.50
-  demo_height_std: 9.64
-  demo_weight_mean: 60.82
-  demo_weight_std: 11.66
-  demo_bmi_mean: 22.92
-  demo_bmi_std: 3.44
 
 sampling:
   prediction_type: v        # shared train (loss target) + infer (ODE)

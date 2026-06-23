@@ -16,11 +16,9 @@ from .pulsedb_dataset import (
     trained_tasks,
 )
 from .transforms import (
-    DEMO_CONT_DIM,
     destandardize_abp,
     patchify,
     standardize_abp,
-    standardize_demo,
     unpatchify,
 )
 
@@ -53,6 +51,4 @@ __all__ = [
     "destandardize_abp",
     "patchify",
     "unpatchify",
-    "standardize_demo",
-    "DEMO_CONT_DIM",
 ]

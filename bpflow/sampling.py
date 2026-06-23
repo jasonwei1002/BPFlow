@@ -26,14 +26,6 @@ def build_flow_matching(cfg) -> FlowMatching:
     )
 
 
-def _demo_to(demo, device: torch.device):
-    """Move a (cont, gender) demographics sample to ``device``, or pass None."""
-    if demo is None:
-        return None
-    cont, gender = demo
-    return cont.to(device), gender.to(device)
-
-
 def _select_target(abp_patches, ecg_patches, ppg_patches, target_idx):
     """Gather each sample's TARGET-modality clean patches (B, N, P) by target_idx
     (0=ABP, 1=ECG, 2=PPG) from the three per-modality patch tensors."""
@@ -58,7 +50,6 @@ def sample_target(
     abp_std: float,
     cond_recenter: bool = True,
     autocast_ctx=None,
-    demo=None,
 ) -> torch.Tensor:
     """Sample the TARGET waveform (shape (B, L)) for each sample's task.
 
@@ -73,9 +64,8 @@ def sample_target(
     ppg_patches = ppg_patches.to(device)
     target_idx = target_idx.to(device).long()
     cond_present = cond_present.to(device)
-    demo = _demo_to(demo, device)
     bs = ecg_patches.shape[0]
-    conditions = model.preprocess_conditions(ecg_patches, ppg_patches, target_idx, cond_present, demo)
+    conditions = model.preprocess_conditions(ecg_patches, ppg_patches, target_idx, cond_present)
     x0 = (
         torch.randn(bs, model.latent_seq_len, model.latent_dim, generator=generator, device=device)
         * fm.noise_scale
@@ -105,7 +95,6 @@ def flow_matching_loss(
     logit_scale: float,
     prediction_type: str,
     loss_type: str,
-    demo=None,
     per_sample: bool = False,
 ) -> torch.Tensor:
     """One flow-matching training step for a per-sample TARGET: select target ->
@@ -119,6 +108,6 @@ def flow_matching_loss(
     target_patches = _select_target(abp_patches, ecg_patches, ppg_patches, target_idx)
     t = log_normal_sample(target_patches, generator=generator, m=logit_mean, s=logit_scale)
     x0, x1, xt, t_sh = fm.get_x0_xt_c(target_patches, t, generator=generator)
-    pred = model(xt, ecg_patches, ppg_patches, t_sh, target_idx, cond_present, demo)
+    pred = model(xt, ecg_patches, ppg_patches, t_sh, target_idx, cond_present)
     per = fm.loss(prediction_type, loss_type, pred, x0, xt, x1, t_sh)  # (B,)
     return per if per_sample else per.mean()
