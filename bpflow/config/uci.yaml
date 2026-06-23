@@ -22,6 +22,17 @@ _base_: gpu.yaml
 model:
   patch_size: 8             # 1024 / 8 = 128 latent tokens (PulseDB used 10 -> 125)
 
+training:
+  # UCI train fold is ~6.4x smaller than PulseDB -> at gpu.yaml's global batch 1024
+  # only ~110 steps/epoch (PulseDB: 704). gpu.yaml's step-based warmup(1000) would
+  # then span ~9 epochs and its 20-epoch early-stop would cover 6x fewer updates.
+  # Shrink the global batch to restore PulseDB-like step density (443 steps/epoch)
+  # and add useful gradient noise on the smaller set; lr is sqrt-rescaled.
+  batch_size: 32            # per-GPU; x8 = global 256 (gpu.yaml: 1024)
+  lr: 1.5e-4               # = 3e-4 x sqrt(256/1024), sqrt-scaled for global batch 256
+  warmup_steps: 500         # ~1.1 epoch at 443 steps/epoch (matches gpu.yaml's ~1.4)
+  early_stop_patience: 40   # gpu.yaml's 20 ep = 6x fewer steps here; widen for convergence
+
 data:
   train_npy: rawdata/uci/UCI_Train_Dataset_fold_1.npy
   test_npy: rawdata/uci/UCI_Test_Dataset_fold_1.npy
