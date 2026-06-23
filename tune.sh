@@ -2,7 +2,7 @@
 # Optuna search over the unified model's modality_dropout_probs.
 # Thin wrapper around tune_modality_probs.py — minimises the best val/MAE (the MEAN
 # waveform MAE across ecg_ppg/ecg/ppg), so it optimises "all three directions good".
-# Each trial = one full unified pretrain via train.sh (DDP/torchrun, all GPUs);
+# Each trial = one full unified pretrain via train_pulsedb.sh (DDP/torchrun, all GPUs);
 # trials run SEQUENTIALLY. ASHA prunes a losing prob mix after a few epochs.
 #
 # PREREQUISITE: run the ecg/ppg specialists FIRST (gpu_ecg.yaml / gpu_ppg.yaml) to

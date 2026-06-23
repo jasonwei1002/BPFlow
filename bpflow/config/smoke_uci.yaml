@@ -1,0 +1,26 @@
+# Tiny CPU smoke for the UCI variant: same overfit pipeline check as smoke.yaml
+# but on UCI dims (seq_len 1024, patch_size 8 -> 128 tokens, matching uci.yaml)
+# and UCI .npy, to verify uci.yaml's shapes flow end to end. NOT a real model.
+#   python -m bpflow.smoke_test --config bpflow/config/smoke_uci.yaml --n-steps 300
+#
+# ~136 s on CPU at 300 steps (slower than the PulseDB smoke: 128 tokens vs 25 ->
+# attention is O((3N)^2)). This is the cheapest config that reliably PASSES, and
+# the cost is intrinsic to validating the real 128-token pipeline. Two speedups
+# were tried and DON'T work (both fail smoke_test's recon gate mae1 < 0.7*mae0,
+# here 0.7*25.57 = 17.9 mmHg):
+#   - coarser patch (16/32): faster/step but the tiny model can't overfit enough
+#     -> recon plateaus ~19-21 mmHg (patch8 hits ~6).
+#   - fewer steps (150): ODE recon quality jumps only between step 150->300
+#     (20.7 -> 6.0), so <300 steps plateaus above threshold.
+
+_base_: smoke.yaml
+
+model:
+  patch_size: 8             # 1024 / 8 = 128 tokens (matches uci.yaml; needed to clear recon gate)
+
+data:
+  train_npy: rawdata/uci/UCI_Train_Dataset_fold_1.npy
+  test_npy: rawdata/uci/UCI_Test_Dataset_fold_1.npy
+  seq_len: 1024
+  abp_mean: 86.7715         # UCI train fold, post-clip[20,250]
+  abp_std: 24.4212

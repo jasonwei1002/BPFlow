@@ -2,14 +2,14 @@
 # Inherits the gpu.yaml architecture; the CalFree `test_npy` is split 8:1:1
 # (per-segment, fixed seed) into train/val/test. Finetune runs on the 80% train and
 # validates on the 10% val for early stopping; it produces weights only and does NOT
-# auto-test. Score the held-out 10% test split separately: bash infer.sh <ckpt>.
+# auto-test. Score the held-out 10% test split separately: bash infer_pulsedb.sh <ckpt>.
 #
 # The `training` block below mirrors gpu.yaml so finetune hyperparameters can be
 # tuned independently here (e.g. a smaller lr / fewer epochs for finetuning)
 # without touching the pretraining config.
 #
 # Use (pass the pretrained checkpoint as the first positional arg):
-#   bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4
+#   bash finetune_pulsedb.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4
 #   python -m bpflow.train --config bpflow/config/finetune.yaml --init-ckpt <pretrained>
 
 _base_: gpu.yaml
@@ -56,7 +56,7 @@ training:
                               # its all_gather is swallowed by _maybe_run_test's
                               # try/except -> surviving ranks hang -> CRASHED, losing
                               # the run). Score the held-out 10% test separately and
-                              # safely with: bash infer.sh <ckpt> --nproc 1
+                              # safely with: bash infer_pulsedb.sh <ckpt> --nproc 1
                               # (single-process, no collective).
   test_max_segments: -1      # all test-split segments (DDP-sharded; -1 = all)
-  # init_from_ckpt is supplied at launch via finetune.sh / --init-ckpt
+  # init_from_ckpt is supplied at launch via finetune_pulsedb.sh / --init-ckpt

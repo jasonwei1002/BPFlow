@@ -11,10 +11,10 @@
 #
 # Use the SAME setup for every low ratio so the data-efficiency curve varies only the
 # data amount, not the optimizer:
-#   bash finetune.sh <ckpt> --config bpflow/config/finetune_lowdata.yaml data.finetune_train_ratio=0.01
-#   bash finetune.sh <ckpt> --config bpflow/config/finetune_lowdata.yaml data.finetune_train_ratio=0.05
-#   bash finetune.sh <ckpt> --config bpflow/config/finetune_lowdata.yaml data.finetune_train_ratio=0.10
-# (finetune.sh's hardcoded --config finetune.yaml is overridden by this later --config.)
+#   bash finetune_pulsedb.sh <ckpt> --config bpflow/config/finetune_lowdata.yaml data.finetune_train_ratio=0.01
+#   bash finetune_pulsedb.sh <ckpt> --config bpflow/config/finetune_lowdata.yaml data.finetune_train_ratio=0.05
+#   bash finetune_pulsedb.sh <ckpt> --config bpflow/config/finetune_lowdata.yaml data.finetune_train_ratio=0.10
+# (finetune_pulsedb.sh's hardcoded --config finetune.yaml is overridden by this later --config.)
 
 _base_: finetune.yaml
 

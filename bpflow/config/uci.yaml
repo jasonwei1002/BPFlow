@@ -1,0 +1,31 @@
+# Pretrain the unified 5-task model on the UCI cuff-less BP dataset (second
+# benchmark; PPG2ABP / MD-ViSCo / UniCardio report on this set).
+#
+# UCI specifics vs PulseDB (the only things that differ):
+#   - window length 1024 (vs 1250); 1024 % patch_size(8) == 0 -> 128 patches.
+#   - ABP z-score constants recomputed on the UCI train fold (clip[20,250]).
+#   - separate train/test fold .h5 -> .npy files (no subject_id CSV), so
+#     split_mode is segment (train/val 80/20 within the train fold; test = the
+#     whole test fold). The .npy are (N,3,1024) ch0=ECG/ch1=PPG/ch2=ABP(mmHg),
+#     identical layout to PulseDB, so PulseDBDataset reads them unchanged.
+#
+# Architecture (patch_size, seq_len) differs from PulseDB -> a UCI checkpoint is
+# NOT interchangeable with a PulseDB one (RoPE grid + patch dims differ). Train
+# fresh; score the held-out test fold with:
+#   python -m bpflow.infer --config bpflow/config/uci.yaml --ckpt <path> \
+#     --split test --num -1 --use-ema
+#
+#   bash train_uci.sh                                        # all GPUs
+
+_base_: gpu.yaml
+
+model:
+  patch_size: 8             # 1024 / 8 = 128 latent tokens (PulseDB used 10 -> 125)
+
+data:
+  train_npy: rawdata/uci/UCI_Train_Dataset_fold_1.npy
+  test_npy: rawdata/uci/UCI_Test_Dataset_fold_1.npy
+  seq_len: 1024             # UCI native window (125 Hz, ~8.19 s); NOT resampled
+  abp_mean: 86.7715         # UCI train fold, post-clip[20,250]
+  abp_std: 24.4212
+  split_mode: segment       # no subject_id in the UCI .npy -> per-segment 80/20

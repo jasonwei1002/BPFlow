@@ -6,7 +6,7 @@
 #                         attention (task-routing mask); the model never sees ECG.
 #   trained_tasks() = {ppg2abp}, baked into the saved config so infer auto-evaluates
 #   just that direction.
-# Pretrain:  bash train.sh --config bpflow/config/gpu_ppg.yaml
+# Pretrain:  bash train_pulsedb.sh --config bpflow/config/gpu_ppg.yaml
 _base_: gpu.yaml
 
 data:

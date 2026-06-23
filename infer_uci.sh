@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
-# Evaluate a finetuned BPFlow checkpoint on the CalFree held-out test split over
-# MULTIPLE seeds, then aggregate per-task per-metric mean+/-std. Single-node,
-# multi-GPU via torchrun.
+# Evaluate a finetuned UCI checkpoint on the held-out UCI test split over MULTIPLE
+# seeds, then aggregate per-task per-metric mean+/-std. Config uci_finetune.yaml
+# (so the split matches finetune's fixed-seed 8:1:1 on the UCI test fold).
+# Single-node, multi-GPU via torchrun.
 #
 # Only the ODE initial noise depends on --seed (the test split is fixed by
 # split_seed, the loader is shuffle=False), so every seed scores the SAME
-# segments -> the spread across seeds is pure sampling variation, exactly what
-# should be reported as mean+/-std.
+# segments -> the spread across seeds is pure sampling variation, reported as mean+/-std.
 #
 # Per seed, --task all evaluates EVERY task the checkpoint trained on (metrics.json
 # nested per task when >1, flat when 1):
 #   ->ABP tasks (ecg_ppg2abp/ecg2abp/ppg2abp) -> clinical (AAMI/BHS) + waveform.
 #   ECG/PPG translation tasks (ppg2ecg/ecg2ppg) -> waveform-only (normalized units).
-#   Clinical TRUE is per-beat on the true ABP wave (no CSV, no definitional offset).
+#   Clinical TRUE is per-beat on the true ABP wave.
 #
 # Args: <checkpoint> [--nproc <gpu|N>] [extra args...]   (--nproc default 'gpu')
 # Env:  SEEDS="0 1 2 3 4"   space-separated seeds to run (default below)
 #       OUTBASE=<dir>       output root (default output/infer_ms_<timestamp>)
 # Examples:
-#   all visible GPUs (default):  bash infer.sh output/<ts>/checkpoint_best.pth
-#   N GPUs:                      bash infer.sh output/<ts>/checkpoint_best.pth --nproc 4
-#   pin one task:                bash infer.sh <path> --task ppg2abp
-#   custom seeds / quick test:   SEEDS="1 2 3" bash infer.sh <path> --nproc 1 --num 100
+#   all visible GPUs (default):  bash infer_uci.sh output/<ts>/checkpoint_best.pth
+#   N GPUs:                      bash infer_uci.sh output/<ts>/checkpoint_best.pth --nproc 4
+#   pin one task:                bash infer_uci.sh <path> --task ppg2abp
+#   custom seeds / quick test:   SEEDS="1 2 3" bash infer_uci.sh <path> --nproc 1 --num 100
 set -euo pipefail
 cd "$(dirname "$0")"
+CONFIG="bpflow/config/uci_finetune.yaml"
 NPROC=gpu
 rest=()
 while [ "$#" -gt 0 ]; do
@@ -34,25 +35,25 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 set -- ${rest[@]+"${rest[@]}"}
-CKPT="${1:?pass a checkpoint: bash infer.sh <path> [--nproc N]}"; shift
+CKPT="${1:?pass a checkpoint: bash infer_uci.sh <path> [--nproc N]}"; shift
 
 SEEDS="${SEEDS:-0 1 2 3 4}"
 OUTBASE="${OUTBASE:-output/infer_ms_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUTBASE"
-echo "[infer.sh] multi-seed eval: seeds=[$SEEDS] ckpt=$CKPT -> $OUTBASE"
+echo "[infer_uci.sh] multi-seed eval: seeds=[$SEEDS] ckpt=$CKPT -> $OUTBASE"
 
 first=1
 for S in $SEEDS; do
   out="$OUTBASE/seed_$S"
   # recon figures only on the first seed (the numbers, not figures, vary by seed)
   if [ "$first" -eq 1 ]; then plot=3; first=0; else plot=0; fi
-  echo "[infer.sh] === seed $S -> $out ==="
+  echo "[infer_uci.sh] === seed $S -> $out ==="
   torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.infer \
-    --config bpflow/config/finetune.yaml --ckpt "$CKPT" \
+    --config "$CONFIG" --ckpt "$CKPT" \
     --split test --num -1 --use-ema --seed "$S" --out "$out" --plot "$plot" "$@"
 done
 
-echo "[infer.sh] aggregating $OUTBASE/seed_*/metrics.json -> $OUTBASE/summary.json"
+echo "[infer_uci.sh] aggregating $OUTBASE/seed_*/metrics.json -> $OUTBASE/summary.json"
 python3 - "$OUTBASE" <<'PY'
 import json
 import math
@@ -119,4 +120,4 @@ for t in tasks:
             print(f"  {k:18} {v['mean']:.4f} +/- {v['std']:.4f}")
 print(f"\nfull summary -> {base / 'summary.json'}")
 PY
-echo "[infer.sh] done."
+echo "[infer_uci.sh] done."

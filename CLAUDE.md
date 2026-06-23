@@ -16,32 +16,40 @@ There is no `README.md`, `pyproject.toml`, or packaging — the project runs as 
 python -m bpflow.smoke_test                       # uses bpflow/config/smoke.yaml
 python -m bpflow.smoke_test --n-steps 600 --n-samples 8
 
+# Scripts come in a PulseDB set (*_pulsedb.sh) and a UCI set (*_uci.sh); the suffix
+# picks the dataset/config. PulseDB uses gpu.yaml/finetune.yaml; UCI uses
+# uci.yaml/uci_finetune.yaml (seq_len 1024, patch_size 8). Examples below show
+# PulseDB; swap _pulsedb -> _uci for the UCI variant.
+
 # Pretrain (single-node, multi-GPU via torchrun). --nproc <gpu|N> picks processes
-# ('gpu' = all visible GPUs, default). Pretraining does NOT touch CalFree (no
-# post-train test); CalFree is reserved for finetune.
-bash train.sh                                     # all GPUs, bpflow/config/gpu.yaml
-bash train.sh --nproc 1                           # single GPU/CPU
-CUDA_VISIBLE_DEVICES=0,1 bash train.sh --nproc 2  # pick GPUs
-bash train.sh --config bpflow/config/other.yaml   # override (args pass through to bpflow.train)
-bash train.sh training.lr=1e-4 data.task_probs=[0.3,0.2,0.2,0.15,0.15]  # dotted key=value CLI config overrides (any field)
+# ('gpu' = all visible GPUs, default). Pretraining does NOT touch the test domain
+# (no post-train test); it is reserved for finetune.
+bash train_pulsedb.sh                                     # all GPUs, bpflow/config/gpu.yaml
+bash train_pulsedb.sh --nproc 1                           # single GPU/CPU
+CUDA_VISIBLE_DEVICES=0,1 bash train_pulsedb.sh --nproc 2  # pick GPUs
+bash train_pulsedb.sh --config bpflow/config/other.yaml   # override (args pass through to bpflow.train)
+bash train_pulsedb.sh training.lr=1e-4 data.task_probs=[0.3,0.2,0.2,0.15,0.15]  # dotted key=value CLI config overrides (any field)
+bash train_uci.sh                                         # UCI pretrain (uci.yaml)
 python -m bpflow.train --config bpflow/config/gpu.yaml   # no torchrun (single process)
 
-# Finetune a pretrained model on the CalFree domain. CalFree (test_npy) is split 8:1:1
-# (fixed seed) into train/val/test; finetunes on 80% (val for early stop) and produces
+# Finetune a pretrained model on the test domain. test_npy is split 8:1:1 (fixed
+# seed) into train/val/test; finetunes on 80% (val for early stop) and produces
 # WEIGHTS ONLY — run_test_after_train is OFF (it deadlocks under DDP). Score the
-# held-out 10% test split separately with infer.sh (below).
+# held-out 10% test split separately with infer_<dataset>.sh (below).
 # Args: <checkpoint> [--nproc N] [extra args]; new output/<ts>/.
-bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth            # all GPUs
-bash finetune.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4  # 4 GPUs
-bash finetune.sh <ckpt> data.finetune_train_ratio=0.25              # data-efficiency sweep (CLI override)
+bash finetune_pulsedb.sh output/<pretrain_ts>/checkpoint_best.pth            # all GPUs (CalFree)
+bash finetune_pulsedb.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4  # 4 GPUs
+bash finetune_pulsedb.sh <ckpt> data.finetune_train_ratio=0.25              # data-efficiency sweep (CLI override)
+bash finetune_uci.sh output/<uci_pretrain_ts>/checkpoint_best.pth           # UCI finetune (uci_finetune.yaml)
 python -m bpflow.train --config bpflow/config/finetune.yaml --init-ckpt <pretrained>
 
-# Score a finetuned checkpoint on the CalFree held-out 10% test split. infer.sh loads
-# finetune.yaml so the split matches finetune's fixed-seed 8:1:1. Defaults to
-# --task all (every trained task) and emits metrics.json, recon plots,
-# and a Bland-Altman agreement plot per truth source. Args: <checkpoint> [--nproc N] [extra args].
-bash infer.sh output/<finetune_ts>/checkpoint_best.pth              # all GPUs, both BP truth sources
-bash infer.sh output/<finetune_ts>/checkpoint_best.pth --nproc 4    # 4 GPUs
+# Score a finetuned checkpoint on the held-out 10% test split over multiple seeds
+# (mean±std). infer_<dataset>.sh loads that dataset's finetune config so the split
+# matches finetune's fixed-seed 8:1:1. Defaults to --task all (every trained task)
+# and emits metrics.json + recon plots. Args: <checkpoint> [--nproc N] [extra args].
+bash infer_pulsedb.sh output/<finetune_ts>/checkpoint_best.pth              # all GPUs (CalFree test split)
+bash infer_pulsedb.sh output/<finetune_ts>/checkpoint_best.pth --nproc 4    # 4 GPUs
+bash infer_uci.sh output/<uci_finetune_ts>/checkpoint_best.pth             # UCI test split
 python -m bpflow.infer --config bpflow/config/finetune.yaml --ckpt <path> --split test --num -1 --use-ema
 
 # Pull SwanLab metrics for the latest run (project "bpflow"; skill: swanlab-skill)
@@ -77,10 +85,10 @@ Three glue modules tie it together and must stay consistent:
 
 ## Config system
 
-OmegaConf structured config with a `_base_:` include chain (resolved in `trainer_utils._merge_base`). Any field is overridable on the CLI as a dotted `key=value` (e.g. `bash train.sh training.lr=1e-4 'data.task_probs=[0.3,0.2,0.2,0.15,0.15]'`), parsed via `OmegaConf.from_dotlist` in `train.py` into `load_config(..., overrides=)`; a typo or type clash fails loudly at the struct-mode merge.
+OmegaConf structured config with a `_base_:` include chain (resolved in `trainer_utils._merge_base`). Any field is overridable on the CLI as a dotted `key=value` (e.g. `bash train_pulsedb.sh training.lr=1e-4 'data.task_probs=[0.3,0.2,0.2,0.15,0.15]'`), parsed via `OmegaConf.from_dotlist` in `train.py` into `load_config(..., overrides=)`; a typo or type clash fails loudly at the struct-mode merge.
 - **`base.yaml`** — architecture, on-disk shapes, ABP normalization constants, prediction_type. Anything here affects **checkpoint compatibility** (`infer.py` asserts `abp_mean`/`abp_std` match the checkpoint). Defaults to `split_mode: segment` and the **multi-target task set** `tasks: [ecg_ppg2abp, ecg2abp, ppg2abp, ppg2ecg, ecg2ppg]` + `task_probs: [0.30, 0.20, 0.20, 0.15, 0.15]` (→ABP-heavy) + `eval_task: ""` — the UNIFIED model (all five tasks in one) is the default; inherited by gpu/finetune. The per-direction **specialist** configs `gpu_ecg.yaml` (`tasks: [ecg2abp]`) and `gpu_ppg.yaml` (`tasks: [ppg2abp]`) override this with a single-task list.
 - **`gpu.yaml`** (inherits `base.yaml`) — real **pretraining** (epochs 1000 as a ceiling; early-stop + plateau decay end runs sooner; per-GPU batch 128, lr 3e-4, SwanLab cloud). Uses `split_mode: segment` (random per-segment train/val). Also `val_eval_fraction: 0.1` (validate on a representative stride-sampled 10% of val) and **`run_test_after_train: false`** — pretraining never touches CalFree (reserved for finetune).
-- **`finetune.yaml`** (inherits `gpu.yaml`) — domain adaptation on CalFree. Spells out its own `training` block (tune finetune hyperparams independently; epochs 1000 ceiling). **`data.finetune: true`** splits the CalFree `test_npy` 8:1:1 (fixed seed) into train/val/test; `finetune_split_mode: stratified` (default) splits each subject's segments 8:1:1 (segment-balanced per subject; `segment` = per-segment random), and `finetune_train_ratio` (default 1.0) sub-samples the finetune-train split for data-efficiency studies (val/test untouched). **`run_test_after_train: false`** (it deadlocks under DDP): finetune produces weights only — score the held-out 10% with `bash infer.sh <ckpt>`. Weights init from a pretrained checkpoint via `--init-ckpt` (→ `training.init_from_ckpt`); optimizer/epoch/step reset.
+- **`finetune.yaml`** (inherits `gpu.yaml`) — domain adaptation on CalFree. Spells out its own `training` block (tune finetune hyperparams independently; epochs 1000 ceiling). **`data.finetune: true`** splits the CalFree `test_npy` 8:1:1 (fixed seed) into train/val/test; `finetune_split_mode: stratified` (default) splits each subject's segments 8:1:1 (segment-balanced per subject; `segment` = per-segment random), and `finetune_train_ratio` (default 1.0) sub-samples the finetune-train split for data-efficiency studies (val/test untouched). **`run_test_after_train: false`** (it deadlocks under DDP): finetune produces weights only — score the held-out 10% with `bash infer_pulsedb.sh <ckpt>`. Weights init from a pretrained checkpoint via `--init-ckpt` (→ `training.init_from_ckpt`); optimizer/epoch/step reset.
 - **`smoke.yaml`** (inherits `base.yaml`) — tiny CPU model for the smoke test (not a real model). Pins **`tasks: [ecg_ppg2abp, ppg2ecg]`, `task_probs: [0.5, 0.5]`** (one →ABP recon task + one target≠ABP bridge task, to exercise multi-target routing), so the smoke test runs from the `.npy` alone (no CSV). `smoke_test.py` itself trains BOTH tasks deterministically on every overfit segment (the batch is duplicated, one copy per task) so the ABP recon gate stays stable.
 
 ## Conventions and gotchas
@@ -103,8 +111,8 @@ OmegaConf structured config with a `_base_:` include chain (resolved in `trainer
 - **Flow-matching loss combos**: only `(v, v)` handles `min_sigma > 0` exactly; the other combos raise rather than train on a wrong target when `min_sigma != 0`.
 - **Data paths live under `rawdata/`** (gitignored), e.g. `rawdata/pulsedb/Train_Subset.npy`. Subject-split (`split_mode: subject` / `finetune_split_mode: stratified`) additionally needs the **sibling CSV** `<npy_basename>.csv` (e.g. `Train_Subset.csv`) for its `subject_id` column, row-aligned to the npy; the dataset raises if it's missing or row counts mismatch. The CSV's `sbp/dbp/map` columns are the **label** — never read them as input.
 - **`split_mode`**: `segment` (base + gpu.yaml default) is a random per-segment train/val split — the same subject lands in both train and val, so val MAE is optimistic. `subject` (optional) splits train/val by the CSV's `subject_id` → subject-disjoint, matches the CalFree test setting (needs the sibling CSV for the train/val split). Either way, **CalFree (test) is the honest, subject-disjoint generalization gate.** Changing `split_mode` changes which segments are train vs val, so metrics aren't comparable across modes.
-- **`run_test_after_train`** (gpu.yaml **false**, finetune.yaml **false**): the in-process post-train test is **OFF everywhere**. When enabled, `Trainer.run_test()` evaluates the **best-by-val EMA** model on the `test` split via the shared `_distributed_eval`, forcing both clinical truth sources (`eval_true_source: both` → `test/*` per-beat-on-true-wave + `test/cuff_*` CSV cuff) and writing `test_metrics.json`. ⚠️ It is off because it can **deadlock under DDP**: a per-rank failure (e.g. `build_dataset`) *before* `_distributed_eval`'s `all_gather` is swallowed by `_maybe_run_test`'s try/except → surviving ranks hang on the collective → the run CRASHES, losing it. **Don't re-enable it under multi-GPU.** Score the test split safely and standalone with `bash infer.sh <ckpt>` (same eval, no in-training collective).
-- **Finetune flow (`data.finetune: true`)** repurposes the CalFree `test_npy`: a fixed-seed 8:1:1 split (`finetune_val_fraction`/`finetune_test_fraction`, default 0.1/0.1) makes train/val/**test** all read CalFree, non-overlapping; `finetune_split_mode` is `stratified` (default, per-subject-balanced) or `segment` (per-segment random), and `finetune_train_ratio` (default 1.0) sub-samples only the finetune-train split (val/test fixed → comparable across ratios). Top-level `split_mode` is ignored. The pretrained model is loaded via **`--init-ckpt`** → `training.init_from_ckpt` (`Trainer._maybe_init_from_ckpt`): it copies `model` (+ `model_ema`) weights only, then trains fresh (optimizer/epoch/step reset). Skipped when resuming an interrupted run. ⚠️ The split is per-segment within subjects, so the same subject can appear in both finetune-train and the held-out test (scored via `infer.sh`) → that test number is optimistic, not subject-disjoint.
+- **`run_test_after_train`** (gpu.yaml **false**, finetune.yaml **false**): the in-process post-train test is **OFF everywhere**. When enabled, `Trainer.run_test()` evaluates the **best-by-val EMA** model on the `test` split via the shared `_distributed_eval`, forcing both clinical truth sources (`eval_true_source: both` → `test/*` per-beat-on-true-wave + `test/cuff_*` CSV cuff) and writing `test_metrics.json`. ⚠️ It is off because it can **deadlock under DDP**: a per-rank failure (e.g. `build_dataset`) *before* `_distributed_eval`'s `all_gather` is swallowed by `_maybe_run_test`'s try/except → surviving ranks hang on the collective → the run CRASHES, losing it. **Don't re-enable it under multi-GPU.** Score the test split safely and standalone with `bash infer_pulsedb.sh <ckpt>` (same eval, no in-training collective).
+- **Finetune flow (`data.finetune: true`)** repurposes the CalFree `test_npy`: a fixed-seed 8:1:1 split (`finetune_val_fraction`/`finetune_test_fraction`, default 0.1/0.1) makes train/val/**test** all read CalFree, non-overlapping; `finetune_split_mode` is `stratified` (default, per-subject-balanced) or `segment` (per-segment random), and `finetune_train_ratio` (default 1.0) sub-samples only the finetune-train split (val/test fixed → comparable across ratios). Top-level `split_mode` is ignored. The pretrained model is loaded via **`--init-ckpt`** → `training.init_from_ckpt` (`Trainer._maybe_init_from_ckpt`): it copies `model` (+ `model_ema`) weights only, then trains fresh (optimizer/epoch/step reset). Skipped when resuming an interrupted run. ⚠️ The split is per-segment within subjects, so the same subject can appear in both finetune-train and the held-out test (scored via `infer_pulsedb.sh`) → that test number is optimistic, not subject-disjoint.
 
 ## Git
 

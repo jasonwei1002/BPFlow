@@ -1,0 +1,29 @@
+# Finetune a UCI-pretrained model, mirroring PulseDB's finetune stage but on UCI.
+# Inherits finetune.yaml (its tuned `training` block + finetune:true + 8:1:1
+# fractions) and overrides only the UCI specifics. The UCI `test_npy` (test fold)
+# is split 8:1:1 (per-segment, fixed seed) into train/val/test; finetune trains on
+# the 80%, validates on the 10%, and produces weights only (run_test_after_train
+# is off). Score the held-out 10% test split separately:
+#   python -m bpflow.infer --config bpflow/config/uci_finetune.yaml --ckpt <path> \
+#     --split test --num -1 --use-ema
+#
+# split_mode is SEGMENT (per-segment random): the UCI .npy carry no subject_id, so
+# stratified/subject splitting is impossible here. This matches the requested
+# PulseDB-style segment split for both stages (pretrain uci.yaml + this finetune).
+#
+# Use (pass the UCI pretrain checkpoint as the first positional arg):
+#   bash finetune_uci.sh output/<uci_pretrain_ts>/checkpoint_best.pth --nproc 4
+#   python -m bpflow.train --config bpflow/config/uci_finetune.yaml --init-ckpt <uci_pretrained>
+
+_base_: finetune.yaml
+
+model:
+  patch_size: 8             # 1024 / 8 = 128 tokens (matches uci.yaml)
+
+data:
+  train_npy: rawdata/uci/UCI_Train_Dataset_fold_1.npy   # unused in finetune (test_npy is split)
+  test_npy: rawdata/uci/UCI_Test_Dataset_fold_1.npy     # split 8:1:1 into train/val/test
+  seq_len: 1024
+  abp_mean: 86.7715         # UCI train fold, post-clip[20,250]
+  abp_std: 24.4212
+  finetune_split_mode: segment   # per-segment random; UCI has no subject_id for stratified

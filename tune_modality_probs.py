@@ -31,7 +31,7 @@ SEARCH SPACE (budget-relative reparam; flagship kept >= 0.20)
 This guarantees sum == 1, flagship in [flag_lo, flag_hi], and lets ppg2abp grow far
 above its current 0.20 (the hypothesis under test).
 
-One trial = one full unified pretrain via ``train.sh`` (DDP/torchrun, all GPUs).
+One trial = one full unified pretrain via ``train_pulsedb.sh`` (DDP/torchrun, all GPUs).
 Trials run SEQUENTIALLY (each grabs the whole node). Pruning: ASHA reads the per-epoch
 ``[val] MAE mean=`` line ``Trainer.validate()`` prints on rank 0 and kills a losing
 allocation after a few epochs instead of burning a full run — the biggest lever when
@@ -80,7 +80,7 @@ logger = logging.getLogger("tune_modality_probs")
 REPO = os.path.dirname(os.path.abspath(__file__))
 _VAL_RE = re.compile(r"MAE mean=([0-9]+\.[0-9]+)")  # matches Trainer.validate()'s rank-0 log line
 
-# The config train.sh loads (it inherits base.yaml's data.tasks). main() asserts
+# The config train_pulsedb.sh loads (it inherits base.yaml's data.tasks). main() asserts
 # this config's task order matches TASK_ORDER below.
 TRAIN_CONFIG = "bpflow/config/gpu.yaml"
 # The 5-task unified set in the exact positional order _suggest_probs assumes
@@ -136,7 +136,7 @@ def _run_training(probs: List[float], name: str, out_root: str, epochs: int, npr
     """
     probs_str = "[" + ",".join(str(p) for p in probs) + "]"  # no shell -> brackets pass literally
     cmd = [
-        "bash", "train.sh", "--nproc", str(nproc),
+        "bash", "train_pulsedb.sh", "--nproc", str(nproc),
         f"data.task_probs={probs_str}",
         f"training.output_dir={out_root}",
         f"training.run_name={name}",                    # exp_dir basename + SwanLab experiment_name
@@ -162,7 +162,7 @@ def _run_training(probs: List[float], name: str, out_root: str, epochs: int, npr
                 _kill(proc)
                 raise _optuna().TrialPruned(f"pruned at epoch ~{step}")
         if proc.wait() != 0:
-            raise RuntimeError(f"train.sh exited {proc.returncode} (trial {trial.number})")
+            raise RuntimeError(f"train_pulsedb.sh exited {proc.returncode} (trial {trial.number})")
     finally:
         if proc.poll() is None:
             _kill(proc)
@@ -246,7 +246,7 @@ def main() -> None:
 
     # Guard the positional probs<->tasks alignment this tuner assumes (the reparam in
     # _suggest_probs hardcodes the 5-task layout). Verify TASK_ORDER matches both the
-    # canonical bpflow.data list AND TRAIN_CONFIG's data.tasks (what train.sh loads),
+    # canonical bpflow.data list AND TRAIN_CONFIG's data.tasks (what train_pulsedb.sh loads),
     # so a reordered/resized task set fails HERE instead of silently misaligning the
     # probs or erroring late inside a spawned trial. (Imports are local to keep
     # torch/bpflow off the --help path.)
@@ -308,7 +308,7 @@ def main() -> None:
     logger.info("study has %d finished trial(s); running %d more (target %d)", done, remaining, args.n_trials)
     if remaining:
         # A single bad trial is marked FAILED and the sweep continues, instead of one
-        # error aborting a multi-day run. Covers train.sh non-zero exit (RuntimeError)
+        # error aborting a multi-day run. Covers train_pulsedb.sh non-zero exit (RuntimeError)
         # AND _read_best_val failures on a trial that never improved — no
         # checkpoint_best.pth (FileNotFoundError) or a checkpoint missing best_val
         # (KeyError). Optuna handles TrialPruned itself, independent of this tuple.
@@ -333,7 +333,7 @@ def main() -> None:
     logger.info("BEST trial %d: task_probs=%s (order %s)  mean ->ABP val/MAE=%.4f",
                 best.number, probs, TASK_ORDER, best.value)
     logger.info("Retrain the winner to full convergence: "
-                "bash train.sh 'data.task_probs=%s'", probs)
+                "bash train_pulsedb.sh 'data.task_probs=%s'", probs)
 
 
 if __name__ == "__main__":
