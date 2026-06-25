@@ -1,0 +1,21 @@
+_base_: base.yaml
+# P2E-WGAN — conditional WGAN-GP, single-stage direct ABP waveform (global).
+model:
+  name: p2e_wgan
+  params:
+    generator_init_filters: 128
+    discriminator_init_filters: 128
+training:
+  # original-paper: Adam lr 2e-4, betas (0.5,0.999), batch 192, n_critic 3,
+  # lambda_gp 10, lambda_sample(MSE) 50. (paper code runs 10000 epochs; 25 kept
+  # as a practical ceiling for this dataset size.)
+  lr: 2.0e-4
+  batch_size: 192
+  epochs: 25
+  scheduler: none
+  early_stop_patience: 0
+  n_critic: 3
+  lambda_gp: 10.0
+  lambda_sample: 50.0
+  gan_beta1: 0.5
+  gan_beta2: 0.999

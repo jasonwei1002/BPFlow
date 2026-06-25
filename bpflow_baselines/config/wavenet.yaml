@@ -1,0 +1,24 @@
+_base_: base.yaml
+# WaveNet (van den Oord, arXiv:1609.03499) — the original paper is raw-audio
+# mu-law generation and specifies NO blood-pressure training recipe, so the
+# training hyperparameters below are an adaptation (Adam/1e-3/150ep/plateau).
+# Architecture (dilated causal conv stack, kernel 2, gated act, residual+skip)
+# follows the paper. Single-stage direct ABP waveform (global min-max).
+model:
+  name: wavenet
+  params:
+    layers: 10
+    blocks: 4
+    dilation_channels: 32
+    residual_channels: 32
+    skip_channels: 256
+    end_channels: 256
+    kernel_size: 2
+training:
+  lr: 1.0e-3
+  batch_size: 32
+  epochs: 150
+  scheduler: plateau
+  lr_patience: 6
+  lr_decay: 0.1
+  early_stop_patience: 12

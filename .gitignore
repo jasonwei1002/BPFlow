@@ -17,7 +17,7 @@ checkpoints/
 *.pt
 *.ckpt
 *.safetensors
-
+MD-ViSCo/
 
 # ===== Large data / array formats (in case any land outside data/) =====
 *.npy

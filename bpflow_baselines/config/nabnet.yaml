@@ -1,0 +1,22 @@
+_base_: base.yaml
+# NABNet — original-paper hyperparameters (official code Sakib1263/NABNet):
+# Adam lr 3e-4, batch 32, 200 epochs, early-stop patience 15, width 64,
+# single-output MSE (deep supervision OFF / D_S=0 in the official notebook).
+# Deviation: the original BP-estimation stage uses classical ML (sklearn
+# MLP/XGBoost); kept as a DL L1 head here for the unified framework.
+model:
+  name: nabnet
+  params:
+    model_depth: 5
+    model_width: 64
+    attention_type: lstm
+    kernel_size: 3
+    d_s: false          # original notebook trains with D_S=0 (single output)
+training:
+  lr: 3.0e-4
+  batch_size: 32
+  epochs: 200
+  scheduler: none
+  early_stop_patience: 15
+  loss_base: mse
+  lambda_bp: 1.0
