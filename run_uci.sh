@@ -74,10 +74,14 @@ PRETRAIN_NAME="uci_pt_${TS}_${PT_TAG}"
 FINETUNE_NAME="uci_ft_${TS}_${FT_TAG}"
 PRETRAIN_DIR="output/$PRETRAIN_NAME"
 FINETUNE_DIR="output/$FINETUNE_NAME"
+# Shared SwanLab group: pretrain + finetune + infer log 3 separate runs grouped
+# under this name on the dashboard.
+GROUP="uci_${TS}_${PT_TAG}"
 
-echo "[1/3] pretrain (uci.yaml) -> $PRETRAIN_DIR"
+echo "[1/3] pretrain (uci.yaml) -> $PRETRAIN_DIR  (SwanLab group $GROUP)"
 torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.train \
-  --config bpflow/config/uci.yaml training.run_name="$PRETRAIN_NAME" \
+  --config bpflow/config/uci.yaml \
+  training.run_name="$PRETRAIN_NAME" training.swanlab_group="$GROUP" \
   ${PT_ARGS[@]+"${PT_ARGS[@]}"}
 
 PT_BEST="$PRETRAIN_DIR/checkpoint_best.pth"
@@ -89,7 +93,7 @@ fi
 echo "[2/3] finetune (uci_finetune.yaml) <- $PT_BEST  ->  $FINETUNE_DIR"
 torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.train \
   --config bpflow/config/uci_finetune.yaml \
-  --init-ckpt "$PT_BEST" training.run_name="$FINETUNE_NAME" \
+  --init-ckpt "$PT_BEST" training.run_name="$FINETUNE_NAME" training.swanlab_group="$GROUP" \
   ${FT_ARGS[@]+"${FT_ARGS[@]}"}
 
 FT_BEST="$FINETUNE_DIR/checkpoint_best.pth"
@@ -113,7 +117,11 @@ export OUTBASE="${OUTBASE:-output/uci_infer_$TS}"
 echo "[3/3] infer (infer_uci.sh) <- $FT_BEST  ->  $OUTBASE"
 bash infer_uci.sh "$FT_BEST" --nproc "$NPROC" ${IN_ARGS[@]+"${IN_ARGS[@]}"}
 
+# Log the held-out test metrics as a 3rd SwanLab run in this pipeline's group.
+# Online only; no-op if swanlab missing / offline. Never fails the pipeline.
+python -m bpflow.infer_swanlab --summary "$OUTBASE/summary.json" --group "$GROUP" --ckpt "$FT_BEST" || true
+
 echo "DONE."
 echo "  pretrain weights : $PT_BEST"
 echo "  finetune weights : $FT_BEST"
-echo "  infer summary    : $OUTBASE/summary.json"
+echo "  infer summary    : $OUTBASE/summary.json  (test/* also a SwanLab run in group $GROUP)"

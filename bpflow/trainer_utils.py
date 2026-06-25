@@ -140,6 +140,10 @@ class TrainingConfig:
     use_swanlab: bool = False  # log metrics to SwanLab (rank-0 only)
     swanlab_project: str = "bpflow"
     swanlab_mode: str = "online"  # online | local | offline | disabled ('cloud' = legacy alias for online)
+    # Group related runs (pretrain / finetune / infer of one pipeline) under a
+    # shared SwanLab group so the dashboard shows them together. Empty = ungrouped.
+    # The run_*.sh orchestrators set one group per pipeline launch.
+    swanlab_group: str = ""
     amp_dtype: str = "bfloat16"  # 'bfloat16' | 'float16' | 'float32' (cuda only)
     use_compile: bool = True  # torch.compile the training-forward path (CUDA only)
     max_steps: int = -1  # cap total steps (smoke); -1 = unlimited

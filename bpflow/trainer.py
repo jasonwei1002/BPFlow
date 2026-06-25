@@ -252,6 +252,10 @@ class Trainer:
         name_kwargs: dict = {}
         if str(self.cfg.training.run_name) and not resume_kwargs:
             name_kwargs["experiment_name"] = self.run_name
+        # Group related pipeline runs (pretrain/finetune/infer) on the dashboard.
+        group_kwargs: dict = {}
+        if str(self.cfg.training.swanlab_group):
+            group_kwargs["group"] = str(self.cfg.training.swanlab_group)
         run = swanlab.init(
             project=str(self.cfg.training.swanlab_project),
             description="BPFlow ECG+PPG -> ABP flow matching",
@@ -259,6 +263,7 @@ class Trainer:
             mode=mode,
             **resume_kwargs,
             **name_kwargs,
+            **group_kwargs,
         )
         self.sw = swanlab
         # Remember this run's id so checkpoints can point --resume back to it.
