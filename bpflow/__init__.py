@@ -9,5 +9,11 @@ physiological signals (ECG + PPG condition the ABP target).
 See ``plan/notes.md`` for the architecture decision record.
 """
 
-__all__ = ["__version__"]
+from ._warnings import configure_warnings
+
+# Runs before any submodule imports torch / swanlab, so import-time *and* runtime
+# non-fatal warnings are filtered for every entrypoint (train / infer / smoke_test).
+configure_warnings()
+
+__all__ = ["__version__", "configure_warnings"]
 __version__ = "0.1.0"
