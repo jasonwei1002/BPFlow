@@ -13,6 +13,7 @@ from .pulsedb_dataset import (
     PulseDBDataset,
     build_dataset,
     resolve_tasks,
+    tasks_slug,
     trained_tasks,
 )
 from .transforms import (
@@ -45,6 +46,7 @@ __all__ = [
     "DEFAULT_TASK_PROBS",
     "resolve_tasks",
     "trained_tasks",
+    "tasks_slug",
     "DATASET_REGISTRY",
     "register_dataset",
     "standardize_abp",

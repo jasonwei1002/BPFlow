@@ -82,6 +82,18 @@ def trained_tasks(tasks: Optional[list], task_probs: Optional[list] = None) -> s
     return {t for t, p in zip(names, probs) if p > 0}
 
 
+def tasks_slug(tasks: Optional[list], task_probs: Optional[list] = None) -> str:
+    """Short, run-name-safe tag for the active training direction(s), so run dirs
+    and SwanLab runs are self-describing. One active task -> its name (e.g.
+    ``ecg2abp``); the full five-task set -> ``uni5``; any other subset -> ``uniN``
+    (N = count). Task names already use ``2`` for ``->`` so the result is a clean
+    identifier; output is stable regardless of input order (sorted by TASK_ORDER)."""
+    ordered = [t for t in TASK_ORDER if t in trained_tasks(tasks, task_probs)]
+    if len(ordered) == 1:
+        return ordered[0]
+    return f"uni{len(ordered)}"
+
+
 def _csv_path_for(npy_path: str) -> str:
     """Sibling CSV that is row-aligned to the npy (Train_Subset.npy -> .csv)."""
     return os.path.splitext(npy_path)[0] + ".csv"

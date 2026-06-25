@@ -19,7 +19,15 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from .data import ABP_TASKS, TASK_ORDER, TASK_SPEC, build_dataset, trained_tasks, unpatchify
+from .data import (
+    ABP_TASKS,
+    TASK_ORDER,
+    TASK_SPEC,
+    build_dataset,
+    tasks_slug,
+    trained_tasks,
+    unpatchify,
+)
 from .eval import aami, bhs, format_report, segment_bp
 from .eval.metrics import _pearson
 from .model import build_model
@@ -205,15 +213,18 @@ class Trainer:
         )
 
     def _make_run_name(self) -> str:
-        """Timestamp run name; rank 0 picks it and broadcasts so DDP ranks agree."""
-        name = datetime.now().strftime("%Y%m%d_%H%M%S") if is_main_process() else ""
+        """Auto run name `<timestamp>_<direction-slug>` so the run dir and SwanLab
+        run are self-describing (e.g. ..._uni5 vs ..._ecg2abp). rank 0 picks the
+        timestamp and broadcasts it; the slug is pure cfg so every rank agrees."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S") if is_main_process() else ""
         if self.distributed:
             import torch.distributed as dist
 
-            obj = [name]
+            obj = [ts]
             dist.broadcast_object_list(obj, src=0)
-            name = obj[0]
-        return name
+            ts = obj[0]
+        slug = tasks_slug(self.cfg.data.tasks, self.cfg.data.task_probs)
+        return f"{ts}_{slug}"
 
     def _init_swanlab(self) -> None:
         """Start a SwanLab run on rank 0 if enabled (lazy import, never fatal)."""
