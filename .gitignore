@@ -67,6 +67,7 @@ credentials.json
 *_token*
 
 # ===== Editor / IDE =====
+.claude/
 .vscode/
 .idea/
 *.swp
