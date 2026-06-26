@@ -42,13 +42,16 @@ training:
   lr_decay: 0.3              # gentler than 0.1 so an early plateau-decay isn't fatal
   early_stop_patience: 20    # >= 2x lr_patience so lr can decay 1-2x before stopping;
                              # unified runs improve late (Run B best @ep260/269)
-  min_delta: 0.02            # mmHg drop that counts as improvement for the two patience
-                             # counters. Without it, a noise-level new low (10%-subsampled
-                             # val) reset patience every few epochs -> early stop never
-                             # fired, runs crept to the ceiling (best @ep248/249, hand-killed).
-                             # 0.02 ~= per-epoch val noise: stop once per-epoch gain stays
-                             # < 0.02 for early_stop_patience rounds. checkpoint_best still
-                             # saves the literal min. Raise (0.05) for a shorter tail.
+  min_delta_frac: 0.005      # RELATIVE drop (frac of best_val) that counts as improvement
+                             # for the two patience counters: reset only if
+                             # val_mae < best_val*(1-frac). Scale-invariant, so the SAME knob
+                             # fits ->ABP (~3 mmHg) and bridge-only (~0.05 normalized) runs.
+                             # Without it, a noise-level new low (10%-subsampled val) reset
+                             # patience every few epochs -> early stop never fired, runs crept
+                             # to the ceiling (best @ep248/249, hand-killed). 0.005 ~= the old
+                             # 0.02 mmHg at the ~3 mmHg ->ABP decision scale (0.02/3~=0.0067),
+                             # a touch more permissive since checkpoint_best keeps the literal
+                             # min regardless. Raise (0.01) for a shorter tail.
   use_swanlab: true
   swanlab_project: bpflow
   swanlab_mode: online      # online | local | offline | disabled
