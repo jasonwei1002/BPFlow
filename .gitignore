@@ -26,7 +26,7 @@ MD-ViSCo/
 *.hdf5
 *.sqlite
 *.db
-
+*.xlsx
 # ===== Python =====
 __pycache__/
 *.py[cod]
