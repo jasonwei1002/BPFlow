@@ -11,6 +11,7 @@ Run:  python -m bpflow.smoke_test [--config bpflow/config/smoke.yaml]
 
 import argparse
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -37,8 +38,21 @@ def _sample_mmhg(model, fm, ecg, ppg, target_idx, cond_present, gen, device, cfg
     return out
 
 
-def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
+def run_smoke(config_path: str, n_samples: int = 4, n_steps: int = 600, quick: bool = False) -> bool:
     set_seed(0)
+    # This tiny model is dominated by CPU thread-pool overhead, not compute: measured
+    # on an M-series CPU, 1 thread (~22 ms/step) beats 5 (~136 ms) and 15 (~175 ms), and
+    # n_samples=4 (batch 8) avoids the BLAS parallel cliff that batch 16 trips (~4x). So
+    # the full gate runs in ~13s instead of ~82s. Single-thread also makes the reductions
+    # deterministic -> a more reproducible pass/fail. Override with --n-samples for more.
+    torch.set_num_threads(1)
+    # --quick: dev inner-loop check. Run the SAME pipeline (data -> forward -> loss ->
+    # backward -> sample) for a handful of steps and assert nothing NaNs/crashes. It
+    # DROPS the loss-collapse + recon gates (those need ~600 steps), so it catches
+    # crashes/NaNs/shape bugs but NOT silent non-learning bugs -> run the default full
+    # gate before committing. ~2-3s vs ~16s.
+    if quick:
+        n_steps = min(n_steps, 20)
     cfg = load_config(config_path)
     device = pick_device("cpu")  # smoke is CPU-only by definition
     logger.info("Smoke: model=%s P=%d hidden=%d depth=%d steps=%d",
@@ -73,10 +87,12 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
     gen.manual_seed(0)
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.training.lr), betas=(0.9, 0.95))
 
-    # baseline (untrained) reconstruction
-    gen.manual_seed(123)
-    pred0 = _sample_mmhg(model, fm, ecg, ppg, eval_ti, eval_cp, gen, device, cfg)
-    mae0 = (pred0 - abp_gt).abs().mean().item()
+    # baseline (untrained) reconstruction — only needed for the recon gate (full mode)
+    mae0 = float("nan")
+    if not quick:
+        gen.manual_seed(123)
+        pred0 = _sample_mmhg(model, fm, ecg, ppg, eval_ti, eval_cp, gen, device, cfg)
+        mae0 = (pred0 - abp_gt).abs().mean().item()
 
     losses = []
     model.train()
@@ -99,6 +115,24 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
 
     gen.manual_seed(123)
     pred1 = _sample_mmhg(model, fm, ecg, ppg, eval_ti, eval_cp, gen, device, cfg)
+
+    if quick:
+        # crash-only verdict: the full pipeline ran; just assert no NaN/inf slipped
+        # through and the sample has the expected (B, L) shape. NO learning gate.
+        losses_finite = all(math.isfinite(x) for x in losses)
+        sample_finite = bool(torch.isfinite(pred1).all().item())
+        shape_ok = tuple(pred1.shape) == tuple(abp_gt.shape)
+        logger.info("=" * 60)
+        logger.info("QUICK: %d steps, loss %.4f -> %.4f | losses_finite=%s sample_finite=%s shape=%s",
+                    n_steps, losses[0], losses[-1], losses_finite, sample_finite, tuple(pred1.shape))
+        logger.info("=" * 60)
+        if losses_finite and sample_finite and shape_ok:
+            logger.info("SMOKE QUICK PASS ✓  (pipeline ran end-to-end, losses + sample finite)")
+            return True
+        logger.error("SMOKE QUICK FAIL ✗  losses_finite=%s sample_finite=%s shape_ok=%s",
+                     losses_finite, sample_finite, shape_ok)
+        return False
+
     mae1 = (pred1 - abp_gt).abs().mean().item()
     report = evaluate(pred1, abp_gt)
 
@@ -135,10 +169,10 @@ def run_smoke(config_path: str, n_samples: int = 8, n_steps: int = 600) -> bool:
 
     # success criteria: loss collapsed AND trained recon clearly beats untrained.
     # recon threshold 0.7 (not 0.6): the tiny CPU model splits capacity across the
-    # two overfit tasks (ABP recon + ppg2ecg), so ABP recon plateaus ~18-19 mmHg
-    # (untrained ~30) in 600 steps. A broken pipeline stays ~1.0, real learning hits
-    # ~0.6 -> 0.7 still cleanly separates the two; this is a pipeline gate, not a
-    # quality bar.
+    # two overfit tasks (ABP recon + ppg2ecg), so ABP recon plateaus ~21 mmHg
+    # (untrained ~33) in 600 steps at the default n_samples=4 (ratio ~0.64). A broken
+    # pipeline stays ~1.0, real learning hits ~0.64 -> 0.7 still cleanly separates the
+    # two; this is a pipeline gate, not a quality bar.
     ok_loss = final_loss < 0.5 * init_loss
     ok_recon = mae1 < 0.7 * mae0
     if ok_loss and ok_recon:
@@ -152,10 +186,13 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description="BPFlow CPU overfit smoke test")
     ap.add_argument("--config", default="bpflow/config/smoke.yaml")
-    ap.add_argument("--n-samples", type=int, default=8)
+    ap.add_argument("--n-samples", type=int, default=4)
     ap.add_argument("--n-steps", type=int, default=600)
+    ap.add_argument("--quick", action="store_true",
+                    help="fast crash-only check (<=20 steps, no loss/recon gate) for the "
+                         "dev inner loop; ~2-3s. Run the default full gate before committing.")
     args = ap.parse_args()
-    ok = run_smoke(args.config, args.n_samples, args.n_steps)
+    ok = run_smoke(args.config, args.n_samples, args.n_steps, quick=args.quick)
     raise SystemExit(0 if ok else 1)
 
 
