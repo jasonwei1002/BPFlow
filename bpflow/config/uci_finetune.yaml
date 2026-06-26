@@ -1,39 +1,39 @@
-# Finetune a UCI-pretrained model, mirroring PulseDB's finetune stage but on UCI.
-# Inherits finetune.yaml (its tuned `training` block + finetune:true + 8:1:1
-# fractions) and overrides only the UCI specifics. The UCI `test_npy` (test fold)
-# is split 8:1:1 (per-segment, fixed seed) into train/val/test; finetune trains on
-# the 80%, validates on the 10%, and produces weights only (run_test_after_train
-# is off). Score the held-out 10% test split separately:
+# Finetune a UCI-pretrained model (mirrors PulseDB's finetune stage, on UCI).
+# Inherits uci.yaml (SAME dataset, pretrain stage) -> UCI data/shapes/normalization
+# + the real-training preset come from there; this file only overrides the finetune
+# deltas. No cross-dataset inheritance.
+#
+# The UCI `test_npy` (test fold) is split 8:1:1 (per-segment, fixed seed) into
+# train/val/test; finetune trains on the 80%, validates on the 10%, and produces
+# weights only (run_test_after_train is off, inherited). Score the held-out 10% test
+# split separately:
 #   python -m bpflow.infer --config bpflow/config/uci_finetune.yaml --ckpt <path> \
 #     --split test --num -1 --use-ema
-#
-# split_mode is SEGMENT (per-segment random): the UCI .npy carry no subject_id, so
-# stratified/subject splitting is impossible here. This matches the requested
-# PulseDB-style segment split for both stages (pretrain uci.yaml + this finetune).
 #
 # Use (pass the UCI pretrain checkpoint as the first positional arg):
 #   bash finetune_uci.sh output/<uci_pretrain_ts>/checkpoint_best.pth --nproc 4
 #   python -m bpflow.train --config bpflow/config/uci_finetune.yaml --init-ckpt <uci_pretrained>
 
-_base_: finetune.yaml
-
-model:
-  patch_size: 8             # 1024 / 8 = 128 tokens (matches uci.yaml)
-
-training:
-  # UCI test fold (the finetune source) is ~2.2x smaller than CalFree -> at
-  # finetune.yaml's global batch 512 only ~79 steps/epoch (PulseDB ft: 174), so its
-  # step-based warmup(1000) would span ~13 epochs. Halve the global batch to 256
-  # (lr sqrt-rescaled); at batch 32 the inherited warmup_steps(1000) and
-  # early_stop_patience(16) already land in PulseDB-finetune's range (~6 ep warmup,
-  # ~2.5k-step patience), so only batch_size + lr need overriding here.
-  batch_size: 32            # per-GPU; x8 = global 256 (finetune.yaml: 512)
-  lr: 1.4e-4               # = 2e-4 x sqrt(256/512), sqrt-scaled for global batch 256
+_base_: uci.yaml           # SAME-dataset stage inheritance (UCI pretrain) — not cross-dataset
 
 data:
-  train_npy: rawdata/uci/UCI_Train_Dataset_fold_1.npy   # unused in finetune (test_npy is split)
-  test_npy: rawdata/uci/UCI_Test_Dataset_fold_1.npy     # split 8:1:1 into train/val/test
-  seq_len: 1024
-  abp_mean: 86.7715         # UCI train fold, post-clip[20,250]
-  abp_std: 24.4212
-  finetune_split_mode: segment   # per-segment random; UCI has no subject_id for stratified
+  finetune: true            # split test_npy (UCI test fold) 8:1:1 into train/val/test
+  finetune_split_mode: segment   # per-segment random; UCI .npy carry no subject_id for
+                                 # stratified/subject splitting. finetune_val_fraction /
+                                 # finetune_test_fraction (0.1/0.1) + finetune_train_ratio
+                                 # (1.0) keep their defaults.
+
+training:
+  # finetune deltas over uci.yaml's pretrain preset (shorter run, gentler lr/patience on
+  # the small UCI test fold; full val since it is cheap). batch_size 32 is inherited
+  # from uci.yaml (global 256) -> no override needed.
+  lr: 1.4e-4               # = 2.0e-4 x sqrt(256/512): PulseDB-finetune lr rescaled to UCI's
+                           # global batch 256 (PulseDB-finetune global batch was 512)
+  warmup_steps: 1000        # ~6 epochs at the finetune step density
+  lr_patience: 8            # < uci.yaml pretrain's 10: finetune val is FULL (less noisy)
+  lr_decay: 0.1             # sharper than pretrain's 0.3
+  early_stop_patience: 16   # >= 2x lr_patience; unified finetune improves late (best ~ep260)
+  val_eval_fraction: 1.0    # full val (override uci.yaml's 0.1): finetune val is small
+                            # (~11k segments) -> full eval is cheap, cleaner best-ckpt picks
+  # run_test_after_train stays false (inherited): the in-process post-train test can
+  # deadlock under DDP. Score the held-out test split with infer_uci.sh instead.

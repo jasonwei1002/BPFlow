@@ -1,10 +1,12 @@
 # BPFlow shared config. train/infer configs reference this via `_base_: base.yaml`.
-# Anything affecting architecture, on-disk shapes, or checkpoint compatibility
-# (patch_size, normalization constants, prediction_type) lives here.
+# Holds ONLY params shared across datasets: model WIDTH (hidden_dim/heads/depth),
+# channel order, split/task system, sampling + training defaults, prediction_type.
+# Dataset-specific shapes/paths/normalization (patch_size, seq_len, train_npy,
+# test_npy, abp_mean, abp_std) live in the per-dataset configs (pulsedb.yaml /
+# uci.yaml); the dataclass defaults in trainer_utils.py back them up (= PulseDB).
 
 model:
   name: bpflow_jointstream  # 3-stream joint attention: ABP latent + ECG + PPG
-  patch_size: 10            # 1250 / 10 = 125 tokens (80 ms each)
   hidden_dim: 512
   num_heads: 8              # head_dim 64 (must be even for RoPE)
   depth: 12
@@ -12,18 +14,15 @@ model:
   joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
 
 data:
-  train_npy: rawdata/pulsedb/Train_Subset.npy
-  test_npy: rawdata/pulsedb/CalFree_Test_Subset.npy
-  seq_len: 1250
+  # train_npy / test_npy / seq_len / abp_mean / abp_std are DATASET-SPECIFIC -> set in
+  # pulsedb.yaml & uci.yaml (dataclass defaults back them up = PulseDB). Not here.
   ecg_channel: 0            # verified: ch0=ECG, ch1=PPG, ch2=ABP
   ppg_channel: 1
   abp_channel: 2
   split_seed: 42
   val_fraction: 0.2
   split_mode: segment       # segment (subject leaks across train/val) | subject (honest)
-  abp_mean: 81.94           # full train split (seed=42, 80%, post-clip)
-  abp_std: 24.43
-  abp_clip_low: 20.0
+  abp_clip_low: 20.0        # physiological ABP clip [20,250] mmHg — shared (post-clip stats)
   abp_clip_high: 250.0
   cond_recenter: true
   # Multi-target task system. Each TRAIN sample draws a (cond->target) task (named
@@ -32,7 +31,7 @@ data:
   # which to train ([] = all five: ecg_ppg2abp, ecg2abp, ppg2abp, ppg2ecg, ecg2ppg);
   # task_probs = the draw distribution aligned to tasks ([] = uniform); eval_task =
   # the single fixed task val uses ("" = first ->ABP task). A single-element tasks
-  # list = a specialist. Default: all five, ->ABP-heavy. Inherited by gpu/finetune/smoke.
+  # list = a specialist. Default: all five, ->ABP-heavy. Inherited by pulsedb/uci/smoke.
   tasks: [ecg_ppg2abp, ecg2abp, ppg2abp, ppg2ecg, ecg2ppg]
   task_probs: [0.30, 0.20, 0.20, 0.15, 0.15]
   eval_task: ""

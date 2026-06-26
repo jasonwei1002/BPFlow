@@ -2,12 +2,12 @@
 
 Loads a trained checkpoint, generates ABP waveforms from ECG+PPG for a chosen
 split, denormalizes to mmHg, and reports waveform + clinical (AAMI/BHS) metrics.
-The `test` split depends on the config: finetune.yaml (data.finetune true) -> the
+The `test` split depends on the config: pulsedb_finetune.yaml (data.finetune true) -> the
 held-out 10% of CalFree the finetune never trained on; otherwise -> the full
 subject-disjoint CalFree test set.
 
 Run (evaluate a finetuned checkpoint on the CalFree held-out test split):
-    python -m bpflow.infer --config bpflow/config/finetune.yaml \
+    python -m bpflow.infer --config bpflow/config/pulsedb_finetune.yaml \
         --ckpt output/<finetune_ts>/checkpoint_best.pth --split test --num -1 --use-ema
 """
 

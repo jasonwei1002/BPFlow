@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pretrain BPFlow on PulseDB (single-node, multi-GPU via torchrun), config gpu.yaml.
+# Pretrain BPFlow on PulseDB (single-node, multi-GPU via torchrun), config pulsedb.yaml.
 # Options:
 #   --nproc <gpu|N>   number of processes ('gpu' = all visible GPUs, default)
 #   all visible GPUs (default):  bash train_pulsedb.sh
@@ -9,12 +9,13 @@
 #   override a config field:     bash train_pulsedb.sh training.lr=1e-4 'data.task_probs=[0.3,0.2,0.2,0.15,0.15]'
 #   resume an interrupted run:   bash train_pulsedb.sh --resume output/<YYYYMMDD_HHMMSS>
 #
-# Per-direction specialists:
-#   bash train_pulsedb.sh --config bpflow/config/gpu_ecg.yaml
-#   bash train_pulsedb.sh --config bpflow/config/gpu_ppg.yaml
+# Per-direction specialist = a single-element tasks list, set via CLI override (the
+# dedicated gpu_ecg/gpu_ppg.yaml configs were removed; a 1-task list IS a specialist):
+#   bash train_pulsedb.sh 'data.tasks=[ecg2abp]'
+#   bash train_pulsedb.sh 'data.tasks=[ppg2abp]'
 set -euo pipefail
 cd "$(dirname "$0")"
-CONFIG="bpflow/config/gpu.yaml"
+CONFIG="bpflow/config/pulsedb.yaml"
 NPROC=gpu
 rest=()
 while [ "$#" -gt 0 ]; do

@@ -1,9 +1,9 @@
 """BPFlow training entrypoint.
 
 Single GPU / CPU:
-    python -m bpflow.train --config bpflow/config/gpu.yaml
+    python -m bpflow.train --config bpflow/config/pulsedb.yaml
 Multi-GPU (DDP):
-    torchrun --nproc_per_node=N -m bpflow.train --config bpflow/config/gpu.yaml
+    torchrun --nproc_per_node=N -m bpflow.train --config bpflow/config/pulsedb.yaml
 """
 
 import argparse

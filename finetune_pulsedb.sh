@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Finetune a PulseDB-pretrained model on the CalFree domain (config finetune.yaml).
+# Finetune a PulseDB-pretrained model on the CalFree domain (config pulsedb_finetune.yaml).
 # CalFree is split 8:1:1 (per-segment) into train/val/test; this finetunes on the
 # 80% train (val for early stop) and produces weights only -- run_test_after_train
 # is OFF (it can deadlock under DDP). Score the held-out 10% test split separately
@@ -11,7 +11,7 @@
 #   data-efficiency sweep:       bash finetune_pulsedb.sh <path> data.finetune_train_ratio=0.25 training.lr=3e-5
 set -euo pipefail
 cd "$(dirname "$0")"
-CONFIG="bpflow/config/finetune.yaml"
+CONFIG="bpflow/config/pulsedb_finetune.yaml"
 NPROC=gpu
 rest=()
 while [ "$#" -gt 0 ]; do

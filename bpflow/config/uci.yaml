@@ -17,21 +17,33 @@
 #
 #   bash train_uci.sh                                        # all GPUs
 
-_base_: gpu.yaml
+_base_: base.yaml          # inherits ONLY base — no cross-dataset inheritance
 
 model:
   patch_size: 8             # 1024 / 8 = 128 latent tokens (PulseDB used 10 -> 125)
 
 training:
-  # UCI train fold is ~6.4x smaller than PulseDB -> at gpu.yaml's global batch 1024
-  # only ~110 steps/epoch (PulseDB: 704). gpu.yaml's step-based warmup(1000) would
-  # then span ~9 epochs and its 20-epoch early-stop would cover 6x fewer updates.
-  # Shrink the global batch to restore PulseDB-like step density (443 steps/epoch)
-  # and add useful gradient noise on the smaller set; lr is sqrt-rescaled.
-  batch_size: 32            # per-GPU; x8 = global 256 (gpu.yaml: 1024)
+  # --- real-training preset (kept identical to pulsedb.yaml's pretrain preset, but
+  #     spelled out here so uci.yaml stands alone on base.yaml — not inheriting PulseDB) ---
+  epochs: 1000               # ceiling only; early-stop + plateau decay end runs sooner
+  num_workers: 2             # PER RANK (8 GPUs x 16 cores -> ~2/rank; see pulsedb.yaml)
+  device: cuda
+  val_freq_epoch: 1          # validate every epoch so the patience counters count epochs
+  val_eval_fraction: 0.1     # stride-sampled 10% of val (covers all subjects; cheap MAE trend)
+  val_loss_max_batches: -1   # per-modality val flow-matching loss on the FULL val split
+  lr_patience: 10            # epochs w/o val improvement -> lr x lr_decay
+  lr_decay: 0.3              # gentler than 0.1 so an early plateau-decay isn't fatal
+  early_stop_patience: 20    # >= 2x lr_patience; unified runs improve late. UNIFIED with
+                             # PulseDB (both 20): the batch-32 shrink below restores step
+                             # density to 443 vs PulseDB's 704 /epoch (1.59x fewer, NOT the
+                             # 6x batch-1024 hypothetical), so 20 ep ~= PulseDB's step-patience.
+  min_delta_frac: 0.005      # RELATIVE improvement threshold (frac of best_val), scale-invariant
+  use_swanlab: true
+  # --- UCI-specific deltas: shrink the global batch to restore PulseDB-like step
+  #     density on the ~6.4x smaller train fold (~110 -> 443 steps/epoch); lr sqrt-rescaled ---
+  batch_size: 32            # per-GPU; x8 = global 256 (PulseDB pretrain: 1024)
   lr: 1.5e-4               # = 3e-4 x sqrt(256/1024), sqrt-scaled for global batch 256
-  warmup_steps: 500         # ~1.1 epoch at 443 steps/epoch (matches gpu.yaml's ~1.4)
-  early_stop_patience: 40   # gpu.yaml's 20 ep = 6x fewer steps here; widen for convergence
+  warmup_steps: 500         # ~1.1 epoch at 443 steps/epoch
 
 data:
   train_npy: rawdata/uci/UCI_Train_Dataset_fold_1.npy

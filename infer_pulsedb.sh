@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Evaluate a finetuned PulseDB/CalFree checkpoint on the held-out test split over
-# MULTIPLE seeds, then aggregate per-task per-metric mean+/-std. Config finetune.yaml
+# MULTIPLE seeds, then aggregate per-task per-metric mean+/-std. Config pulsedb_finetune.yaml
 # (so the split matches finetune's fixed-seed 8:1:1). Single-node, multi-GPU via torchrun.
 #
 # Only the ODE initial noise depends on --seed (the test split is fixed by
@@ -23,7 +23,7 @@
 #   custom seeds / quick test:   SEEDS="1 2 3" bash infer_pulsedb.sh <path> --nproc 1 --num 100
 set -euo pipefail
 cd "$(dirname "$0")"
-CONFIG="bpflow/config/finetune.yaml"
+CONFIG="bpflow/config/pulsedb_finetune.yaml"
 NPROC=gpu
 rest=()
 while [ "$#" -gt 0 ]; do

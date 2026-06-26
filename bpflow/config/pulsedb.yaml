@@ -1,7 +1,7 @@
 # Real-training config (single/multi-GPU). 3-stream joint-attention model.
 # Inherits architecture + normalization from base.yaml.
-# Use:    python -m bpflow.train --config bpflow/config/gpu.yaml
-# DDP:    torchrun --nproc_per_node=N -m bpflow.train --config bpflow/config/gpu.yaml
+# Use:    python -m bpflow.train --config bpflow/config/pulsedb.yaml
+# DDP:    torchrun --nproc_per_node=N -m bpflow.train --config bpflow/config/pulsedb.yaml
 
 _base_: base.yaml
 
@@ -13,6 +13,12 @@ model:
   joint_depth: 8            # first 8 layers 3-stream joint; last 4 latent-only
 
 data:
+  # PulseDB-specific shapes/paths/normalization (moved out of base.yaml; UCI sets its own).
+  train_npy: rawdata/pulsedb/Train_Subset.npy
+  test_npy: rawdata/pulsedb/CalFree_Test_Subset.npy
+  seq_len: 1250             # 1250 / patch_size(10) = 125 tokens (80 ms each)
+  abp_mean: 81.94           # full train split (seed=42, 80%, post-clip[20,250])
+  abp_std: 24.43
   split_mode: segment       # random per-segment train/val split (subjects shared across split)
   # The UNIFIED multi-target task set is the base.yaml default → inherited here.
 

@@ -56,7 +56,7 @@ while ASHA still kills clearly-losing allocations by ~ep40-60 (72-86% of the dro
 in by then). Per-surviving-trial cost == one real pretrain, not more.
 
 Resumable: re-run the same command; the SQLite study (``--storage``) continues. Each
-trial also logs its own SwanLab run (gpu.yaml use_swanlab=true), so per-trial curves
+trial also logs its own SwanLab run (pulsedb.yaml use_swanlab=true), so per-trial curves
 live in SwanLab; the study DB holds the (task_probs -> best_val) map.
 """
 from __future__ import annotations
@@ -80,9 +80,10 @@ logger = logging.getLogger("tune_modality_probs")
 REPO = os.path.dirname(os.path.abspath(__file__))
 _VAL_RE = re.compile(r"MAE mean=([0-9]+\.[0-9]+)")  # matches Trainer.validate()'s rank-0 log line
 
-# The config train_pulsedb.sh loads (it inherits base.yaml's data.tasks). main() asserts
+# The config train_pulsedb.sh loads (pulsedb.yaml; its data.tasks are inherited from
+# base.yaml, while PulseDB data/shapes are set in pulsedb.yaml itself). main() asserts
 # this config's task order matches TASK_ORDER below.
-TRAIN_CONFIG = "bpflow/config/gpu.yaml"
+TRAIN_CONFIG = "bpflow/config/pulsedb.yaml"
 # The 5-task unified set in the exact positional order _suggest_probs assumes
 # (flagship / ecg2abp / ppg2abp / bridge / bridge). main() verifies this equals
 # bpflow.data.TASK_ORDER AND TRAIN_CONFIG's data.tasks, so a reordered or resized

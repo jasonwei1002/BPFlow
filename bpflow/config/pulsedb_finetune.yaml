@@ -1,18 +1,18 @@
 # Finetune config: adapt a pretrained model to the CalFree domain.
-# Inherits the gpu.yaml architecture; the CalFree `test_npy` is split 8:1:1
+# Inherits the pulsedb.yaml architecture; the CalFree `test_npy` is split 8:1:1
 # (per-segment, fixed seed) into train/val/test. Finetune runs on the 80% train and
 # validates on the 10% val for early stopping; it produces weights only and does NOT
 # auto-test. Score the held-out 10% test split separately: bash infer_pulsedb.sh <ckpt>.
 #
-# The `training` block below mirrors gpu.yaml so finetune hyperparameters can be
+# The `training` block below mirrors pulsedb.yaml so finetune hyperparameters can be
 # tuned independently here (e.g. a smaller lr / fewer epochs for finetuning)
 # without touching the pretraining config.
 #
 # Use (pass the pretrained checkpoint as the first positional arg):
 #   bash finetune_pulsedb.sh output/<pretrain_ts>/checkpoint_best.pth --nproc 4
-#   python -m bpflow.train --config bpflow/config/finetune.yaml --init-ckpt <pretrained>
+#   python -m bpflow.train --config bpflow/config/pulsedb_finetune.yaml --init-ckpt <pretrained>
 
-_base_: gpu.yaml
+_base_: pulsedb.yaml
 
 data:
   finetune: true            # split test_npy (CalFree) 8:1:1 into train/val/test
@@ -27,10 +27,10 @@ data:
                                    # still overlap; needs sibling CSV for subject_id).
 
 training:
-  # --- finetune hyperparameters (currently identical to gpu.yaml; tune freely) ---
+  # --- finetune hyperparameters (currently identical to pulsedb.yaml; tune freely) ---
   epochs: 1000               # ceiling only; early stop + plateau decay end runs sooner
   batch_size: 64            # per-GPU (DDP global = 64 x num_gpus)
-  num_workers: 2             # PER RANK (see gpu.yaml): 8 GPUs x 16 cores -> 2/rank avoids the
+  num_workers: 2             # PER RANK (see pulsedb.yaml): 8 GPUs x 16 cores -> 2/rank avoids the
                              # train+val worker oversubscription that OOM-killed a worker at val.
   lr: 2.0e-4                 # finetune lr 
   warmup_steps: 1000
@@ -39,12 +39,12 @@ training:
   use_ema: true
   max_steps: -1
   val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
-  val_eval_fraction: 1.0     # full val (override gpu.yaml's 0.1): finetune val is
+  val_eval_fraction: 1.0     # full val (override pulsedb.yaml's 0.1): finetune val is
                              # small (~11k segments), so full eval is cheap and gives
                              # cleaner best-ckpt decisions
   val_loss_max_batches: -1   # per-modality val flow-matching loss on the FULL val split (-1 = all)
   lr_patience: 8             # raised for the unified model (slow/noisy fixed-direction val);
-                             # less than gpu.yaml's 10 since finetune val is full (less noisy)
+                             # less than pulsedb.yaml's 10 since finetune val is full (less noisy)
   lr_decay: 0.1
   early_stop_patience: 16    # >= 2x lr_patience; unified finetune improves late (best @ep260)
   use_swanlab: true

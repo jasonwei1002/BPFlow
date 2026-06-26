@@ -4,9 +4,9 @@
 #
 # Run dirs carry the active direction slug (uni5 for the unified model, or a single
 # direction like ecg2abp) so stages and SwanLab runs are easy to tell apart:
-#   Stage 1  pretrain (gpu.yaml) on Train_Subset            -> output/pdb_pt_<ts>_<dir>/
+#   Stage 1  pretrain (pulsedb.yaml) on Train_Subset            -> output/pdb_pt_<ts>_<dir>/
 #            (run_name pinned so we know exactly where best lands)
-#   Stage 2  finetune (finetune.yaml), init from stage-1 checkpoint_best.pth, on the
+#   Stage 2  finetune (pulsedb_finetune.yaml), init from stage-1 checkpoint_best.pth, on the
 #            CalFree test_npy 8:1:1 split (weights only)     -> output/pdb_ft_<ts>_<dir>/
 #   Stage 3  infer (delegates to infer_pulsedb.sh): multi-seed score of stage-2
 #            checkpoint_best.pth on the held-out test split -> output/pdb_infer_<ts>/
@@ -68,8 +68,8 @@ PY
 # pure-numeric "<ts>" would be read as an int (underscores = digit separators)
 # and the dir we compute here would not match the trainer's actual exp_dir.
 TS="$(date +%Y%m%d_%H%M%S)"
-PT_TAG="$(dir_tag bpflow/config/gpu.yaml ${PT_ARGS[@]+"${PT_ARGS[@]}"})"
-FT_TAG="$(dir_tag bpflow/config/finetune.yaml ${FT_ARGS[@]+"${FT_ARGS[@]}"})"
+PT_TAG="$(dir_tag bpflow/config/pulsedb.yaml ${PT_ARGS[@]+"${PT_ARGS[@]}"})"
+FT_TAG="$(dir_tag bpflow/config/pulsedb_finetune.yaml ${FT_ARGS[@]+"${FT_ARGS[@]}"})"
 PRETRAIN_NAME="pdb_pt_${TS}_${PT_TAG}"
 FINETUNE_NAME="pdb_ft_${TS}_${FT_TAG}"
 PRETRAIN_DIR="output/$PRETRAIN_NAME"
@@ -78,9 +78,9 @@ FINETUNE_DIR="output/$FINETUNE_NAME"
 # under this name on the dashboard.
 GROUP="pdb_${TS}_${PT_TAG}"
 
-echo "[1/3] pretrain (gpu.yaml) -> $PRETRAIN_DIR  (SwanLab group $GROUP)"
+echo "[1/3] pretrain (pulsedb.yaml) -> $PRETRAIN_DIR  (SwanLab group $GROUP)"
 torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.train \
-  --config bpflow/config/gpu.yaml \
+  --config bpflow/config/pulsedb.yaml \
   training.run_name="$PRETRAIN_NAME" training.swanlab_group="$GROUP" \
   ${PT_ARGS[@]+"${PT_ARGS[@]}"}
 
@@ -90,9 +90,9 @@ if [ ! -f "$PT_BEST" ]; then
   exit 1
 fi
 
-echo "[2/3] finetune (finetune.yaml) <- $PT_BEST  ->  $FINETUNE_DIR"
+echo "[2/3] finetune (pulsedb_finetune.yaml) <- $PT_BEST  ->  $FINETUNE_DIR"
 torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.train \
-  --config bpflow/config/finetune.yaml \
+  --config bpflow/config/pulsedb_finetune.yaml \
   --init-ckpt "$PT_BEST" training.run_name="$FINETUNE_NAME" training.swanlab_group="$GROUP" \
   ${FT_ARGS[@]+"${FT_ARGS[@]}"}
 

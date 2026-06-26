@@ -5,7 +5,8 @@
 # Each trial = one full unified pretrain via train_pulsedb.sh (DDP/torchrun, all GPUs);
 # trials run SEQUENTIALLY. ASHA prunes a losing prob mix after a few epochs.
 #
-# PREREQUISITE: run the ecg/ppg specialists FIRST (gpu_ecg.yaml / gpu_ppg.yaml) to
+# PREREQUISITE: run the ecg/ppg specialists FIRST (single-task lists via CLI override,
+# e.g. `bash train_pulsedb.sh 'data.tasks=[ecg2abp]'` / `'data.tasks=[ppg2abp]'`) to
 # learn each direction's ceiling. If ppg is info-limited (its specialist also fails
 # AAMI), no prob mix recovers it — don't run this search blind.
 #
