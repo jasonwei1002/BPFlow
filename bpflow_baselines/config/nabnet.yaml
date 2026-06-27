@@ -1,22 +1,22 @@
 _base_: base.yaml
-# NABNet — original-paper hyperparameters (official code Sakib1263/NABNet):
-# Adam lr 3e-4, batch 32, 200 epochs, early-stop patience 15, width 64,
-# single-output MSE (deep supervision OFF / D_S=0 in the official notebook).
-# Deviation: the original BP-estimation stage uses classical ML (sklearn
-# MLP/XGBoost); kept as a DL L1 head here for the unified framework.
+# NABNet — aligned to MD-ViSCo defaults (NABNetModelConfig + approximation_trainer_nabnet):
+# Adam lr 1e-3, batch 32, 100 epochs, early-stop patience 20, width 128 (paper §3.4 best),
+# deep supervision ON (D_S=1; aux outputs auto-weighted by waveform_loss's linear decay).
+# Deviation: the original BP-estimation stage uses classical ML (sklearn MLP/XGBoost);
+# kept as a DL L1 head here for the unified framework.
 model:
   name: nabnet
   params:
     model_depth: 5
-    model_width: 64
+    model_width: 128
     attention_type: lstm
     kernel_size: 3
-    d_s: false          # original notebook trains with D_S=0 (single output)
+    d_s: true           # MD-ViSCo NABNetModelConfig.D_S=1 (deep supervision on)
 training:
-  lr: 3.0e-4
+  lr: 1.0e-3
   batch_size: 32
-  epochs: 200
+  epochs: 100
   scheduler: none
-  early_stop_patience: 15
+  early_stop_patience: 20
   loss_base: mse
   lambda_bp: 1.0

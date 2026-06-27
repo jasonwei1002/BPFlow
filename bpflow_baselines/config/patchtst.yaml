@@ -2,8 +2,8 @@ _base_: base.yaml
 # PatchTST — original-paper hyperparameters (Nie 2023, official scripts):
 # Adam lr 1e-4, batch 128, 100 epochs, OneCycleLR (lradj=TST, pct_start 0.3),
 # patience 100 (effectively no early stop). patch_len 16 / stride 8 / d_model 128
-# / 3 layers / 16 heads / dropout 0.2 / fc_dropout 0.2 / head_dropout 0
-# (the large-dataset config, e.g. weather.sh).
+# / 3 layers / 16 heads / dropout 0.2. fc_dropout/head_dropout aligned to MD-ViSCo
+# PatchTSTModelConfig defaults (0.1 / 0.1; Nie large-dataset config used 0.2 / 0).
 model:
   name: patchtst
   params:
@@ -13,8 +13,8 @@ model:
     num_encoder_layers: 3
     num_heads: 16
     dropout: 0.2
-    fc_dropout: 0.2
-    head_dropout: 0.0
+    fc_dropout: 0.1
+    head_dropout: 0.1
 training:
   lr: 1.0e-4
   batch_size: 128
