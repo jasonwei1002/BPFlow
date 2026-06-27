@@ -114,7 +114,7 @@ def make_run_dir(cfg, dist_info: Dict[str, int]) -> str:
     return run_dir
 
 
-def init_swanlab(cfg):
+def init_swanlab(cfg, run_dir: str = ""):
     if not bool(cfg.training.use_swanlab) or not is_main_process():
         return None
     try:
@@ -123,19 +123,81 @@ def init_swanlab(cfg):
         logger.warning("swanlab not installed; metric logging disabled")
         return None
     from omegaconf import OmegaConf
-    run = swanlab.init(
+    init_kwargs = dict(
         project=str(cfg.training.swanlab_project),
         experiment_name=(str(cfg.training.run_name) or None),
         description=f"baseline {cfg.model.name} {cfg.baseline.direction}",
         config=OmegaConf.to_container(cfg, resolve=True),
         mode=str(cfg.training.swanlab_mode),
     )
+    group = str(cfg.training.swanlab_group)
+    if group:
+        init_kwargs["group"] = group
+    run = swanlab.init(**init_kwargs)
+    # Persist this run's id so a later (separate-process) infer can resume it and
+    # append test/* to the SAME run instead of opening a new infer run.
+    run_id = getattr(run, "id", None)
+    if run_dir and run_id:
+        try:
+            with open(os.path.join(run_dir, "swanlab_run_id"), "w") as f:
+                f.write(str(run_id))
+        except OSError as e:
+            logger.warning("could not persist swanlab_run_id: %s", e)
     return run
 
 
 def sw_log(run, data: Dict[str, float], step: int) -> None:
     if run is not None and is_main_process():
         run.log(data, step=step)
+
+
+def flatten_report(report: dict, prefix: str = "test") -> Dict[str, float]:
+    """Flatten an eval report into scalar SwanLab metrics (mirrors bpflow's
+    trainer._flat_report): waveform.* plus per-BP AAMI/BHS summaries."""
+    out = {f"{prefix}/{k}": float(v) for k, v in report.get("waveform", {}).items()}
+    for key in ("SBP", "DBP", "MAP"):
+        if key not in report:                 # waveform-only (bridge) report
+            continue
+        aami, bhs = report[key]["AAMI"], report[key]["BHS"]
+        out[f"{prefix}/{key}_ME"] = float(aami["ME"])
+        out[f"{prefix}/{key}_SDE"] = float(aami["SDE"])
+        out[f"{prefix}/{key}_AAMI_pass"] = float(aami["pass"])
+        out[f"{prefix}/{key}_within5mmHg"] = float(bhs["<=5mmHg"])
+    return out
+
+
+def log_test_to_run(cfg, report: dict, ft_run_dir: str) -> bool:
+    """Resume the finetune SwanLab run (id saved in ft_run_dir/swanlab_run_id) and
+    append test/* metrics, so test scores land in the SAME run as finetune — no
+    separate infer run. Never fatal; returns True if logged."""
+    if not bool(cfg.training.use_swanlab):
+        return False
+    id_path = os.path.join(ft_run_dir, "swanlab_run_id")
+    if not os.path.exists(id_path):
+        logger.warning("no swanlab_run_id in %s; skipping test logging "
+                       "(was the finetune run logged with use_swanlab=true?).", ft_run_dir)
+        return False
+    mode = str(cfg.training.swanlab_mode)
+    if mode not in ("online", "cloud"):       # resume-by-id is online-only in SwanLab
+        logger.warning("swanlab resume needs online mode (got %s); skipping test logging.", mode)
+        return False
+    try:
+        import swanlab
+    except ImportError:
+        logger.warning("swanlab not installed; skipping test logging.")
+        return False
+    run_id = open(id_path).read().strip()
+    metrics = flatten_report(report, "test")
+    try:
+        swanlab.init(project=str(cfg.training.swanlab_project), id=run_id,
+                     resume="allow", mode=mode)
+        swanlab.log(metrics)
+        swanlab.finish()
+    except Exception as e:  # noqa: BLE001 — logging must never break infer
+        logger.warning("test SwanLab logging failed (%s); metrics stay in metrics.json.", e)
+        return False
+    logger.info("appended %d test/* metrics to SwanLab run %s.", len(metrics), run_id)
+    return True
 
 
 # ---------------------------------------------------------------------------

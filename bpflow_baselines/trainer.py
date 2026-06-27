@@ -115,7 +115,7 @@ def train(cfg) -> str:
             pct_start=float(cfg.training.onecycle_pct_start))
 
     run_dir = engine.make_run_dir(cfg, dist_info)
-    sw = engine.init_swanlab(cfg)
+    sw = engine.init_swanlab(cfg, run_dir)
     if is_main_process():
         logger.info("baseline=%s direction=%s run_dir=%s want_bp=%s N_train=%d N_val=%d",
                     cfg.model.name, direction, run_dir, want_bp, len(train_ds), len(val_ds))

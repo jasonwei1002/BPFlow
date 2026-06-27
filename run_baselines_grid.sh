@@ -15,6 +15,8 @@
 #   bash run_baselines_grid.sh --models "nabnet patchtst" --directions "ecg2abp ppg2abp"
 #   bash run_baselines_grid.sh --stages "infer"                 # only (re)score existing finetunes
 #   bash run_baselines_grid.sh --dry-run                        # print the plan, run nothing
+#   bash run_baselines_grid.sh --no-swanlab                     # disable SwanLab (default: ON, one group/grid run)
+#   bash run_baselines_grid.sh --group my_baselines             # custom SwanLab group name
 #   bash run_baselines_grid.sh -- training.batch_size=64        # extra overrides after --
 # no `set -u`: empty arrays (EXTRA/FAILED/...) trip it on macOS's bash 3.2
 set -o pipefail
@@ -27,6 +29,8 @@ NPROC=gpu
 SKIP=0
 DRY=0
 OUT="output/baselines"
+SWANLAB=1
+GROUP=""
 EXTRA=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -37,6 +41,8 @@ while [ "$#" -gt 0 ]; do
     --out) OUT="${2:?}"; shift 2;;
     --skip-existing) SKIP=1; shift;;
     --dry-run) DRY=1; shift;;
+    --no-swanlab) SWANLAB=0; shift;;
+    --group) GROUP="${2:?}"; shift 2;;
     --) shift; EXTRA=("$@"); break;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
@@ -44,6 +50,18 @@ done
 
 LOGS="$OUT/logs"
 mkdir -p "$LOGS"
+# All cells in this grid run share ONE SwanLab group; each cell logs a pretrain
+# run and a finetune run (infer APPENDS test/* to the finetune run via run-id
+# resume, NOT a separate infer run). --no-swanlab disables; --group overrides.
+SW_TRAIN=(); SW_INFER=()
+if [ "$SWANLAB" = 1 ]; then
+  [ -z "$GROUP" ] && GROUP="baselines_$(date +%Y%m%d_%H%M%S)"
+  SW_TRAIN=(training.use_swanlab=true "training.swanlab_group=$GROUP")
+  SW_INFER=(training.use_swanlab=true)
+  echo "SwanLab: ON  (project=bpflow-baselines, group=$GROUP)"
+else
+  echo "SwanLab: OFF"
+fi
 has_stage() { echo " $STAGES " | grep -q " $1 "; }
 ckpt_of() { [ -f "$OUT/$1/checkpoint_best.pth" ] && echo "$OUT/$1/checkpoint_best.pth" || echo "$OUT/$1/checkpoint_latest.pth"; }
 
@@ -61,7 +79,7 @@ run_cell() {  # model direction
     else
       echo "  [pretrain] -> $LOGS/$pre.log"
       if ! bash train_baseline_pulsedb.sh "$m" "$d" --nproc "$NPROC" \
-           "${EXTRA[@]}" training.output_dir="$OUT" training.run_name="$pre" >"$LOGS/$pre.log" 2>&1; then
+           "${EXTRA[@]}" "${SW_TRAIN[@]}" training.output_dir="$OUT" training.run_name="$pre" >"$LOGS/$pre.log" 2>&1; then
         echo "  [pretrain] FAILED (see $LOGS/$pre.log)"; FAILED+=("$m/$d:pretrain"); return
       fi
     fi
@@ -78,7 +96,7 @@ run_cell() {  # model direction
     else
       echo "  [finetune] -> $LOGS/$ft.log"
       if ! bash finetune_baseline_pulsedb.sh "$m" "$d" "$init" --nproc "$NPROC" \
-           "${EXTRA[@]}" training.output_dir="$OUT" training.run_name="$ft" >"$LOGS/$ft.log" 2>&1; then
+           "${EXTRA[@]}" "${SW_TRAIN[@]}" training.output_dir="$OUT" training.run_name="$ft" >"$LOGS/$ft.log" 2>&1; then
         echo "  [finetune] FAILED (see $LOGS/$ft.log)"; FAILED+=("$m/$d:finetune"); return
       fi
     fi
@@ -95,7 +113,7 @@ run_cell() {  # model direction
     else
       echo "  [infer] -> $LOGS/${ft}_infer.log"
       if ! bash infer_baseline_pulsedb.sh "$m" "$d" "$fck" \
-           "${EXTRA[@]}" >"$LOGS/${ft}_infer.log" 2>&1; then
+           "${EXTRA[@]}" "${SW_INFER[@]}" >"$LOGS/${ft}_infer.log" 2>&1; then
         echo "  [infer] FAILED (see $LOGS/${ft}_infer.log)"; FAILED+=("$m/$d:infer"); return
       fi
     fi

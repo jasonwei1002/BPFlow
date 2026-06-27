@@ -24,7 +24,7 @@ from bpflow.trainer_utils import pick_device, set_seed
 
 from .config import load_config, overrides_from_extra
 from .data import build_baseline_dataset
-from .engine import load_state
+from .engine import load_state, log_test_to_run
 from .models.base import build_model, pad_to_multiple
 from .norms import ABP_TARGET_MODE
 from .reconstruct import reconstruct_pred, reconstruct_true
@@ -114,7 +114,11 @@ def main() -> None:
     cfg.model.name = args.model
     cfg.baseline.direction = args.direction
     out_dir = args.out or os.path.join(os.path.dirname(args.ckpt) or ".", f"infer_{args.direction}")
-    run(cfg, args.ckpt, args.split, args.num, out_dir)
+    report = run(cfg, args.ckpt, args.split, args.num, out_dir)
+    # Append test/* to the finetune SwanLab run (its id was saved next to the
+    # checkpoint), so test scores land in the SAME run as finetune — no separate
+    # infer run. No-op unless use_swanlab=true and that id file exists.
+    log_test_to_run(cfg, report, os.path.dirname(os.path.abspath(args.ckpt)))
 
 
 if __name__ == "__main__":

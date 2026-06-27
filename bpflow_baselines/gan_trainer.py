@@ -101,7 +101,7 @@ def train(cfg) -> str:
     max_steps = int(cfg.training.max_steps)
 
     run_dir = engine.make_run_dir(cfg, dist_info)
-    sw = engine.init_swanlab(cfg)
+    sw = engine.init_swanlab(cfg, run_dir)
     if is_main_process():
         logger.info("P2E-WGAN direction=%s run_dir=%s N_train=%d", direction, run_dir, len(train_ds))
 

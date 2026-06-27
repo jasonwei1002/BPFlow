@@ -73,6 +73,7 @@ class BaselineTrainingConfig:
     use_swanlab: bool = False
     swanlab_project: str = "bpflow-baselines"
     swanlab_mode: str = "online"
+    swanlab_group: str = ""          # group related runs (pretrain/finetune) on the dashboard
     amp_dtype: str = "float32"       # baselines default to fp32 (small nets, stable)
     max_steps: int = -1
     repeat_factor: int = 1

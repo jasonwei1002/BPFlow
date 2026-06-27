@@ -40,4 +40,5 @@ training:
   amp_dtype: float32
   use_swanlab: false
   swanlab_project: bpflow-baselines
+  swanlab_group: ""        # set by run_baselines_grid.sh so all cells share one group
   output_dir: output/baselines
