@@ -21,9 +21,9 @@ model:
 training:
   # MD-ViSCo paper: batch 2048, lr 1e-3, scheduler patience 3, early-stop 5,
   # max 30K steps. NOTE: the upgraded PatchTSMixer BP head (~43.7M for ->ABP)
-  # makes batch 2048 OOM — dropped to 256 (bf16 autocast also on via base.yaml).
+  # makes batch 2048 OOM — dropped to 1024 (bf16 autocast also on via base.yaml).
   lr: 1.0e-3
-  batch_size: 256       # GLOBAL (auto-split across GPUs); was 2048 pre-upgrade
+  batch_size: 1024      # GLOBAL (auto-split across GPUs); was 2048 pre-upgrade
   epochs: 1000          # ceiling; max_steps governs
   max_steps: 30000
   scheduler: plateau
