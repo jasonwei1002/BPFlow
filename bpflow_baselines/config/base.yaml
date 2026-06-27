@@ -37,7 +37,7 @@ training:
   log_freq: 50
   ckpt_freq_epoch: 5
   device: auto
-  amp_dtype: float32
+  amp_dtype: bfloat16      # bf16 autocast in supervised trainer (GAN keeps fp32)
   use_swanlab: false
   swanlab_project: bpflow-baselines
   swanlab_group: ""        # set by run_baselines_grid.sh so all cells share one group

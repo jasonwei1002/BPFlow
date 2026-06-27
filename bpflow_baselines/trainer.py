@@ -120,6 +120,15 @@ def train(cfg) -> str:
         logger.info("baseline=%s direction=%s run_dir=%s want_bp=%s N_train=%d N_val=%d",
                     cfg.model.name, direction, run_dir, want_bp, len(train_ds), len(val_ds))
 
+    # mixed precision (bf16/fp16 autocast). bf16 needs no GradScaler; fp16 does.
+    # Disabled on CPU / when amp_dtype=float32 -> identical to the fp32 path.
+    amp_dtype = str(cfg.training.amp_dtype)
+    use_amp = amp_dtype in ("bfloat16", "float16") and torch.cuda.is_available()
+    amp_t = torch.bfloat16 if amp_dtype == "bfloat16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == "float16"))
+    if use_amp and is_main_process():
+        logger.info("AMP autocast enabled: %s", amp_dtype)
+
     global_step = 0
     for epoch in range(int(cfg.training.epochs)):
         ddp_model.train()
@@ -128,17 +137,20 @@ def train(cfg) -> str:
         for batch in train_loader:
             x = pad_to_multiple(batch["x"].to(device), work_mult)
             y = pad_to_multiple(batch["y"].to(device), work_mult)
-            out = ddp_model(x, want_bp=want_bp)
-            loss = waveform_loss(out, y, base=loss_base, aux_base=aux_loss_base)
-            if want_bp:
-                loss = loss + lambda_bp * bp_l1(
-                    out["bp"], batch["sbp"].to(device), batch["dbp"].to(device),
-                    float(cfg.data.abp_clip_low), float(cfg.data.abp_clip_high))
+            with torch.autocast("cuda", dtype=amp_t, enabled=use_amp):
+                out = ddp_model(x, want_bp=want_bp)
+                loss = waveform_loss(out, y, base=loss_base, aux_base=aux_loss_base)
+                if want_bp:
+                    loss = loss + lambda_bp * bp_l1(
+                        out["bp"], batch["sbp"].to(device), batch["dbp"].to(device),
+                        float(cfg.data.abp_clip_low), float(cfg.data.abp_clip_high))
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
             if clip_grad > 0:
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             if onecycle is not None:
                 onecycle.step()
             global_step += 1
