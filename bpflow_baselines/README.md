@@ -99,7 +99,7 @@ DDP via torchrun.
 ### Full sweep + comparison table
 
 ```bash
-# Run the whole 6x4 grid (pretrain -> finetune -> infer per cell). Resumable
+# Run the whole 6x5 grid (pretrain -> finetune -> infer per cell). Resumable
 # (--skip-existing), fault-tolerant (a failed cell doesn't abort the sweep),
 # deterministic run dirs output/baselines/<model>_<direction>_{pre,ft}/.
 bash run_baselines_grid.sh                                   # full grid, all GPUs
