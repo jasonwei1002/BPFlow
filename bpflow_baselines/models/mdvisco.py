@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from timm.layers import DropPath, trunc_normal_
+from transformers import PatchTSMixerConfig, PatchTSMixerForRegression
 
 from .base import (
     BaselineModule,
@@ -892,6 +893,7 @@ class UNetSwinUnet(nn.Module):
         swin_attn_drop_rate: float = 0.0,
         swin_drop_path_rate: float = 0.1,
         leaky_relu_negative_slope: float = 0.2,
+        deep_supervision: bool = False,
     ) -> None:
         super().__init__()
         if upsample_scale is None:
@@ -1008,6 +1010,17 @@ class UNetSwinUnet(nn.Module):
             nn.Conv1d(features, out_channels, kernel_size=1, padding=0, bias=False),
         )
 
+        # Deep-supervision heads (MD-ViSCo trains stage-1 with multi-scale MSE).
+        # head[0] supervises the bottleneck output (deepest/coarsest scale);
+        # head[1] supervises the first decoder stage's upsample output. Each aux
+        # is interpolated to full length + linearly weighted in waveform_loss.
+        self.deep_supervision = deep_supervision
+        if deep_supervision:
+            aux_chs = [embed_dim // patch_size, self.decoder[0].conv2.out_channels]
+            self.aux_heads = nn.ModuleList(
+                [nn.Conv1d(c, out_channels, kernel_size=1) for c in aux_chs]
+            )
+
     @staticmethod
     def _block(in_channels: int, features: int, k: int, name: str) -> nn.Sequential:
         return nn.Sequential(
@@ -1029,7 +1042,9 @@ class UNetSwinUnet(nn.Module):
             )
         )
 
-    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, s: torch.Tensor
+    ) -> tuple[torch.Tensor, List[torch.Tensor]]:
         enc = self.conv_init_features(x)
         encoder: List[torch.Tensor] = []
         for i in range(0, len(self.encoder), 3):
@@ -1042,50 +1057,74 @@ class UNetSwinUnet(nn.Module):
 
         bottleneck = self.bottleneck(enc, s)
 
+        # Deep-supervision aux predictions (coarse -> fine), interpolated to full
+        # length + linearly weighted in waveform_loss. Empty when disabled.
+        aux: List[torch.Tensor] = []
+        if self.deep_supervision:
+            aux.append(self.aux_heads[0](bottleneck))       # bottleneck (deepest)
+
         dec = bottleneck
         for idx, i in enumerate(range(0, len(self.decoder), 2)):
             dec = self.decoder[i](dec, s)
+            if self.deep_supervision and idx + 1 < len(self.aux_heads):
+                aux.append(self.aux_heads[idx + 1](dec))    # first decoder stage
             if idx < len(encoder):
                 dec = torch.cat([dec, encoder[idx]], dim=1)
             dec = self.decoder[i + 1](dec, s)
         out = self.last(dec)
-        return out
+        return out, aux
 
 
 # ---------------------------------------------------------------------------
 # BP head (stage-2 stand-in for ->ABP directions)
 # ---------------------------------------------------------------------------
-class BPHead(nn.Module):
-    """Small conv encoder + global pool + MLP mapping a waveform to (SBP, DBP).
+class PatchTSMixerBPHead(nn.Module):
+    """PatchTSMixer SBP/DBP regressor — the stage-2 refinement for ->ABP.
 
-    Output is linear (no activation); trained in global-min-max [0,1] (via bp_l1),
-    de-normalized to mmHg in reconstruct.py — NOT raw mmHg.
+    Faithful to MD-ViSCo's stage-2 ``BPModel`` capacity: a deep PatchTSMixer
+    backbone (default num_layers=15, d_model=64, expansion=5, patch=4, matching
+    the upstream ``WaveformEncoder``) maps the raw source waveform to (SBP, DBP).
+    Replaces the earlier lightweight conv head so MD-ViSCo's BP accuracy is not
+    under-represented. Output is linear in global-min-max [0,1] (de-normalized to
+    mmHg in reconstruct.py — NOT raw mmHg), trained with L1 (bp_l1).
     """
 
-    def __init__(self, in_channels: int = 1, hidden: int = 64) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        context_length: int,
+        *,
+        patch_length: int = 4,
+        patch_stride: int = 4,
+        d_model: int = 64,
+        num_layers: int = 15,
+        expansion_factor: int = 5,
+        head_dropout: float = 0.2,
+    ) -> None:
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv1d(in_channels, hidden, kernel_size=7, stride=2, padding=3),
-            nn.InstanceNorm1d(hidden, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv1d(hidden, hidden * 2, kernel_size=5, stride=2, padding=2),
-            nn.InstanceNorm1d(hidden * 2, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv1d(hidden * 2, hidden * 2, kernel_size=3, stride=2, padding=1),
-            nn.InstanceNorm1d(hidden * 2, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
+        if context_length % patch_length != 0:
+            raise ValueError(
+                f"PatchTSMixerBPHead needs context_length ({context_length}) "
+                f"divisible by patch_length ({patch_length})."
+            )
+        cfg = PatchTSMixerConfig(
+            context_length=context_length,
+            num_input_channels=in_channels,
+            d_model=d_model,
+            num_layers=num_layers,
+            expansion_factor=expansion_factor,
+            patch_length=patch_length,
+            patch_stride=patch_stride,
+            num_targets=2,
+            head_dropout=head_dropout,
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden, 2),
-        )
+        self.model = PatchTSMixerForRegression(cfg)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.features(x)
-        h = self.pool(h).squeeze(-1)
-        return self.mlp(h)
+        # x: (B, C, L) source waveform -> PatchTSMixer expects (B, L, C)
+        past_values = x.permute(0, 2, 1)              # (B, L, C)
+        out = self.model(past_values=past_values)
+        return out.regression_outputs                  # (B, 2) = (SBP, DBP)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1141,7 @@ class MDViSCoBaseline(BaselineModule):
         style_dim: int,
         has_bp_head: bool,
         unet_kwargs: Dict[str, Any],
+        bp_head_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.work_multiple = work_multiple
@@ -1118,21 +1158,27 @@ class MDViSCoBaseline(BaselineModule):
         self.register_buffer("style", style)
 
         # forward() feeds the raw source x (B, C, L) — not the generated wave —
-        # to bp_head, so it must match the UNet's input channel count.
+        # to bp_head, so it must match the UNet's input channel count. The head is
+        # a PatchTSMixer regressor over the (padded) work-length source signal,
+        # matching MD-ViSCo stage-2 BPModel capacity.
         bp_in = int(unet_kwargs.get("in_channels", 1))
-        self.bp_head = BPHead(in_channels=bp_in) if has_bp_head else None
+        self.bp_head = (
+            PatchTSMixerBPHead(in_channels=bp_in, context_length=input_length,
+                               **(bp_head_kwargs or {}))
+            if has_bp_head else None
+        )
 
     def forward(
         self, x: torch.Tensor, want_bp: bool = False
     ) -> Dict[str, object]:
         s = self.style.to(dtype=x.dtype).expand(x.size(0), self.style_dim)
-        wave = self.generator(x, s)
+        wave, wave_aux = self.generator(x, s)
 
         bp: Optional[torch.Tensor] = None
         if want_bp and self.bp_head is not None:
             bp = self.bp_head(x)
 
-        return {"wave": wave, "wave_aux": [], "bp": bp}
+        return {"wave": wave, "wave_aux": wave_aux, "bp": bp}
 
 
 # ---------------------------------------------------------------------------
@@ -1206,6 +1252,18 @@ def factory(params: dict, seq_len: int, direction: str) -> BaselineModule:
         "swin_num_heads": swin_num_heads,
         "swin_mlp_ratio": swin_mlp_ratio,
         "swin_drop_path_rate": swin_drop_path_rate,
+        "deep_supervision": bool(p.get("deep_supervision", False)),
+    }
+
+    # stage-2 BP head (PatchTSMixer) hyper-params — aligned to MD-ViSCo BPModel's
+    # WaveformEncoder (num_layers=15, d_model=64, expansion=5, patch=4).
+    bp_head_kwargs: Dict[str, Any] = {
+        "patch_length": int(p.get("bp_patch_length", 4)),
+        "patch_stride": int(p.get("bp_patch_stride", 4)),
+        "d_model": int(p.get("bp_d_model", 64)),
+        "num_layers": int(p.get("bp_num_layers", 15)),
+        "expansion_factor": int(p.get("bp_expansion_factor", 5)),
+        "head_dropout": float(p.get("bp_head_dropout", 0.2)),
     }
 
     return MDViSCoBaseline(
@@ -1215,4 +1273,5 @@ def factory(params: dict, seq_len: int, direction: str) -> BaselineModule:
         style_dim=style_dim,
         has_bp_head=tgt_is_abp,
         unet_kwargs=unet_kwargs,
+        bp_head_kwargs=bp_head_kwargs,
     )

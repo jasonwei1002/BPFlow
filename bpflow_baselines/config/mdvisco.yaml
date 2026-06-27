@@ -12,6 +12,12 @@ model:
     swin_drop_path_rate: 0.1
     kernel_size: 3
     style_dim: 3
+    deep_supervision: true   # MD-ViSCo stage-1 multi-scale (deep) supervision
+    # stage-2 BP head (PatchTSMixer, aligned to MD-ViSCo BPModel WaveformEncoder):
+    bp_num_layers: 15
+    bp_d_model: 64
+    bp_expansion_factor: 5
+    bp_patch_length: 4
 training:
   # MD-ViSCo paper: batch 2048 (GLOBAL), lr 1e-3, scheduler patience 3,
   # early-stop patience 5, max 30K training steps.

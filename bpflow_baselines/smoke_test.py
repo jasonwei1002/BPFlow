@@ -39,7 +39,10 @@ SMALL = {
                  "num_heads": 4, "dropout": 0.0},
     "p2e_wgan": {"generator_init_filters": 16, "discriminator_init_filters": 16},
     "mdvisco": {"init_features": 8, "patch_size": 4, "depth": 1, "embedding_dim_multiplier": 2,
-                "swin_num_heads": [2, 2, 2, 2, 2], "swin_mlp_ratio": 2.0, "kernel_size": 3},
+                "swin_num_heads": [2, 2, 2, 2, 2], "swin_mlp_ratio": 2.0, "kernel_size": 3,
+                "deep_supervision": True,  # exercise the multi-scale aux path
+                # tiny stage-2 PatchTSMixer BP head so the CPU smoke stays fast
+                "bp_num_layers": 2, "bp_d_model": 16, "bp_expansion_factor": 2},
 }
 MODELS = ["wavenet", "nabnet", "ppg2abp", "patchtst", "p2e_wgan", "mdvisco"]
 
