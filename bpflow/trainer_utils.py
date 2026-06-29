@@ -98,10 +98,11 @@ class SamplingConfig:
 class TrainingConfig:
     loss_type: str = "v"  # 'x' or 'v'
     epochs: int = 100
-    batch_size: int = 64
-    # Batch size for validation / test (eager sampler, no backward → safe to make
+    batch_size: int = 64  # GLOBAL batch (summed across ranks); trainer divides by world_size
+    # GLOBAL batch for validation / test (eager sampler, no backward → safe to make
     # large independent of the train batch). -1 = reuse batch_size. Set this larger
-    # than a tiny train batch_size so small-batch runs don't pay a slow validation.
+    # than a tiny train batch so small-batch runs don't pay a slow validation. Both
+    # are divided by world_size to get the per-GPU loader batch.
     val_batch_size: int = -1
     num_workers: int = 4
     lr: float = 1.0e-4

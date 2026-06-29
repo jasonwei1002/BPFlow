@@ -124,15 +124,28 @@ class Trainer:
                 self.train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True
             )
         self.sampler = sampler
+        # batch_size / val_batch_size in config are GLOBAL batches (summed across all
+        # ranks); the per-GPU loader batch is global // world_size. So global batch is
+        # fixed regardless of GPU count, and lr (sqrt-scaled for the global batch) no
+        # longer needs to track GPU count.
+        global_bs = int(self.cfg.training.batch_size)
+        self.batch_size = max(1, global_bs // self.world_size)
+        if global_bs % self.world_size and is_main_process():
+            logger.warning(
+                "batch_size %d not divisible by world_size %d -> per-GPU batch floored "
+                "to %d (effective global batch %d)",
+                global_bs, self.world_size, self.batch_size, self.batch_size * self.world_size,
+            )
         # Validation/test batch (eager sampler, no backward → safe to keep large even
-        # when batch_size is tiny). -1 = reuse the train batch_size. Shared by the val
-        # loader below and run_test's loader.
+        # when the train batch is tiny). -1 = reuse the train GLOBAL batch. Shared by
+        # the val loader below and run_test's loader (also divided by world_size).
         vbs = int(self.cfg.training.val_batch_size)
-        self.val_batch_size = vbs if vbs > 0 else int(self.cfg.training.batch_size)
+        global_vbs = vbs if vbs > 0 else global_bs
+        self.val_batch_size = max(1, global_vbs // self.world_size)
         num_workers = int(self.cfg.training.num_workers)
         self.loader = DataLoader(
             self.train_ds,
-            batch_size=int(self.cfg.training.batch_size),
+            batch_size=self.batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
             num_workers=num_workers,

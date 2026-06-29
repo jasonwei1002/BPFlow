@@ -24,7 +24,7 @@ sampling:
   num_steps: 5
 
 training:
-  batch_size: 8
+  batch_size: 8              # GLOBAL batch; smoke runs single-process so = per-GPU
   num_workers: 0
   lr: 5.0e-4
   warmup_steps: 20

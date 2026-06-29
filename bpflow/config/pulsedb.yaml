@@ -24,12 +24,11 @@ data:
 
 training:
   epochs: 1000               # ceiling only; early_stop_patience + plateau decay end runs sooner
-  batch_size: 128            # per-GPU (DDP global = 128 x num_gpus)
-  num_workers: 2             # PER RANK -> total = num_workers x num_gpus x (train + val).
-                             # Tuned for an 8-GPU / 16-core node (~2 cores/rank): 8 left the
-                             # train (persistent) + val workers oversubscribing 16 cores and
-                             # OOM-killing a worker at validation. Raise on fatter nodes.
-  lr: 3.0e-4               # 8 GPUs x bs128 = global 1024
+  batch_size: 1024           # GLOBAL batch (auto-divided by num_gpus; 8 GPUs -> 128/GPU)
+  num_workers: 8             # PER RANK -> total = num_workers x num_gpus x (train + val).
+                             # Tuned for a 2-GPU / 40-core node (~20 cores/rank): train
+                             # (persistent) 8 + val 8 peaks at 16 < 20, with headroom.
+  lr: 3.0e-4               # sqrt-scaled for global batch 1024
   warmup_steps: 1000
   device: cuda
   amp_dtype: bfloat16
