@@ -26,7 +26,7 @@ training:
   # --- real-training preset (kept identical to pulsedb.yaml's pretrain preset, but
   #     spelled out here so uci.yaml stands alone on base.yaml — not inheriting PulseDB) ---
   epochs: 1000               # ceiling only; early-stop + plateau decay end runs sooner
-  num_workers: 8             # PER RANK (2 GPUs x 40 cores -> ~20/rank; see pulsedb.yaml)
+  num_workers: 2             # PER RANK (most-constrained 8-GPU/16-core node -> ~2/rank; see pulsedb.yaml)
   device: cuda
   val_freq_epoch: 1          # validate every epoch so the patience counters count epochs
   val_eval_fraction: 0.1     # stride-sampled 10% of val (covers all subjects; cheap MAE trend)

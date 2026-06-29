@@ -50,7 +50,9 @@ training:
   loss_type: v
   epochs: 100
   batch_size: 64             # GLOBAL batch (auto-divided by num_gpus); per-dataset configs override
-  num_workers: 8             # PER RANK default (40-core / 2-GPU node; ~20 cores/rank)
+  num_workers: 2             # PER RANK default, set for the most-constrained node (16-core /
+                             # 8-GPU = ~2 cores/rank). H800 nodes are GPU-bound (SM~100%) so 2
+                             # costs no speed; higher would oversubscribe the 16-core node.
   lr: 1.0e-4
   weight_decay: 0.0
   warmup_steps: 1000

@@ -30,16 +30,18 @@ training:
   # --- finetune hyperparameters (currently identical to pulsedb.yaml; tune freely) ---
   epochs: 1000               # ceiling only; early stop + plateau decay end runs sooner
   batch_size: 512            # GLOBAL batch (auto-divided by num_gpus; 8 GPUs -> 64/GPU)
-  num_workers: 8             # PER RANK. On 2 GPUs x 40-core / 128G there's ample host headroom
-                             # (the 64G/8-GPU rank0 OOM-kill that once forced 1 no longer applies);
-                             # ~20 cores/rank feeds 8 train + 8 val workers with room to spare.
+  num_workers: 1             # PER RANK. Finetune's FULL val (val_eval_fraction 1.0) on a 64G/8-GPU
+                             # node is the tightest host-RAM point: 2 + compile is exactly what
+                             # OOM-killed rank0 at val before. 1 keeps it safe; H800 is GPU-bound so
+                             # 1 costs no speed there either.
   lr: 2.0e-4                 # finetune lr 
   warmup_steps: 1000
   device: cuda
   amp_dtype: bfloat16
   use_ema: true
-  # use_compile inherits base default (True): on 2x H800 / 128G the per-rank inductor
-  # cache is no longer a host-RAM concern, and the compile speedup is worth keeping.
+  use_compile: false         # OFF: on a 64G/8-GPU node the per-rank inductor cache + full-val peak
+                             # exhaust host RAM (rank0 OOM-kill). H800 nodes can re-enable via CLI
+                             # (training.use_compile=true) — headroom is there and SM is saturated.
   max_steps: -1
   val_freq_epoch: 1          # validate every epoch so patience below counts in epochs
   val_eval_fraction: 1.0     # full val (override pulsedb.yaml's 0.1): finetune val is
