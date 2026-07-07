@@ -18,6 +18,7 @@
 #   --ft "<overrides>"  extra dotted key=value overrides for the FINETUNE stage only
 #   --in "<args>"       extra args forwarded to infer_pulsedb.sh (e.g. "--task ppg2abp --num 100")
 #   --skip-infer        stop after finetune (produce weights only, no scoring)
+#   --tag <suffix>      append _<suffix> to the pinned run/dir/group names (e.g. an ablation id)
 # Env (consumed by the infer stage via infer_pulsedb.sh):
 #   SEEDS="0 1 2 3 4"   space-separated seeds for the multi-seed eval
 #   OUTBASE=<dir>       infer output root (default output/pdb_infer_<ts>)
@@ -35,6 +36,7 @@ cd "$(dirname "$0")"
 
 NPROC=gpu
 SKIP_INFER=0
+TAG=""
 PT_ARGS=()
 FT_ARGS=()
 IN_ARGS=()
@@ -46,7 +48,9 @@ while [ "$#" -gt 0 ]; do
     --ft) read -r -a FT_ARGS <<< "${2-}"; shift 2;;
     --in) read -r -a IN_ARGS <<< "${2-}"; shift 2;;
     --skip-infer) SKIP_INFER=1; shift;;
-    *) echo "unknown arg: $1 (use --nproc / --pt / --ft / --in / --skip-infer)" >&2; exit 2;;
+    --tag) TAG="${2:?--tag needs a value}"; shift 2;;
+    --tag=*) TAG="${1#*=}"; shift;;
+    *) echo "unknown arg: $1 (use --nproc / --pt / --ft / --in / --skip-infer / --tag)" >&2; exit 2;;
   esac
 done
 
@@ -70,13 +74,13 @@ PY
 TS="$(date +%Y%m%d_%H%M%S)"
 PT_TAG="$(dir_tag bpflow/config/pulsedb.yaml ${PT_ARGS[@]+"${PT_ARGS[@]}"})"
 FT_TAG="$(dir_tag bpflow/config/pulsedb_finetune.yaml ${FT_ARGS[@]+"${FT_ARGS[@]}"})"
-PRETRAIN_NAME="pdb_pt_${TS}_${PT_TAG}"
-FINETUNE_NAME="pdb_ft_${TS}_${FT_TAG}"
+PRETRAIN_NAME="pdb_pt_${TS}_${PT_TAG}${TAG:+_$TAG}"
+FINETUNE_NAME="pdb_ft_${TS}_${FT_TAG}${TAG:+_$TAG}"
 PRETRAIN_DIR="output/$PRETRAIN_NAME"
 FINETUNE_DIR="output/$FINETUNE_NAME"
 # Shared SwanLab group: pretrain + finetune + infer log 3 separate runs grouped
 # under this name on the dashboard.
-GROUP="pdb_${TS}_${PT_TAG}"
+GROUP="pdb_${TS}_${PT_TAG}${TAG:+_$TAG}"
 
 echo "[1/3] pretrain (pulsedb.yaml) -> $PRETRAIN_DIR  (SwanLab group $GROUP)"
 torchrun --standalone --nproc_per_node="$NPROC" -m bpflow.train \
@@ -113,7 +117,7 @@ fi
 # Stage 3 delegates to infer_pulsedb.sh (reuses its multi-seed loop + aggregation).
 # Pair the infer output dir with this run's <ts> unless the caller set OUTBASE.
 # SEEDS (if set in the environment) propagates to infer_pulsedb.sh automatically.
-export OUTBASE="${OUTBASE:-output/pdb_infer_$TS}"
+export OUTBASE="${OUTBASE:-output/pdb_infer_${TS}${TAG:+_$TAG}}"
 echo "[3/3] infer (infer_pulsedb.sh) <- $FT_BEST  ->  $OUTBASE"
 bash infer_pulsedb.sh "$FT_BEST" --nproc "$NPROC" ${IN_ARGS[@]+"${IN_ARGS[@]}"}
 

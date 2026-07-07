@@ -34,6 +34,7 @@ def _build_jointstream(cfg) -> nn.Module:
         depth=int(cfg.model.depth),
         joint_depth=int(cfg.model.joint_depth),
         mlp_ratio=float(cfg.model.mlp_ratio),
+        stream_fusion=str(cfg.model.stream_fusion),
     )
 
 

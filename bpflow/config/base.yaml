@@ -12,6 +12,7 @@ model:
   depth: 12
   mlp_ratio: 4.0
   joint_depth: 8            # first 8 layers are 3-stream joint; last 4 are latent-only
+  stream_fusion: joint      # ablation: joint (3-stream cross-attention) | late (per-stream self-attn then concat-fuse)
 
 data:
   # train_npy / test_npy / seq_len / abp_mean / abp_std are DATASET-SPECIFIC -> set in

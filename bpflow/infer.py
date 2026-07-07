@@ -139,6 +139,12 @@ def _sample_and_gather(task, loader, model, fm, gen, device, cfg, seed,
 def run_inference(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     cfg = load_config(args.config)
+    # Optional sampling-steps override (for the quality-vs-steps ablation). Baked
+    # into FlowMatching by build_flow_matching(cfg) below, so set it before that.
+    if args.num_steps is not None:
+        if args.num_steps < 1:
+            raise ValueError(f"--num-steps must be >= 1, got {args.num_steps}")
+        cfg.sampling.num_steps = int(args.num_steps)
 
     # Distributed (single-node multi-GPU via torchrun). When WORLD_SIZE == 1 this
     # is identical to the old single-process path.
@@ -343,6 +349,9 @@ def main() -> None:
                          "translation: waveform-only); or pin one. Each appears under "
                          "its name in metrics.json when more than one is evaluated.")
     ap.add_argument("--num", type=int, default=-1, help="max segments (-1 = all)")
+    ap.add_argument("--num-steps", type=int, default=None,
+                    help="override sampling.num_steps (ODE steps); default = config value. "
+                         "Use for the quality-vs-steps ablation, e.g. --num-steps 4")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--use-ema", action="store_true")

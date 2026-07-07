@@ -62,10 +62,17 @@ def build_task_mask(
     *,
     dtype: torch.dtype,
     device: torch.device,
+    routing: str = "routed",     # routed (no-leak) | selfonly (block-diagonal, for the late-fusion ablation)
 ) -> torch.Tensor:
     """Additive ``(B, 1, S*N, S*N)`` mask: ``0`` where attention is allowed, ``-inf``
     where blocked (S = NUM_STREAMS). ``cond_present`` for the target's own slot is
-    ignored (a target is never its own condition)."""
+    ignored (a target is never its own condition).
+
+    ``routing`` selects the attention pattern:
+    - ``routed`` (default): target query attends {itself + present conditions}; a
+      condition query attends {present conditions only, never the noised target}.
+    - ``selfonly``: each stream attends only its own tokens (block-diagonal), used
+      by the late-fusion ablation where streams are encoded independently."""
     b = target_idx.shape[0]
     idx = torch.arange(NUM_STREAMS, device=device)
     qs = idx.view(1, NUM_STREAMS, 1)
@@ -77,11 +84,17 @@ def build_task_mask(
     condk = cond.view(b, 1, NUM_STREAMS)
     is_tq = qs == tgt
     is_tk = ks == tgt
-    allow = (
-        (is_tq & (is_tk | condk))           # target query  -> target + present conditions
-        | (condq & condk)                    # condition query -> present conditions
-        | (qs == ks)                         # diagonal always open (absent self; no empty row)
-    )  # (B, S, S) bool
+    self_open = qs == ks  # diagonal always open (absent self; no empty row -> no softmax NaN)
+    if routing == "selfonly":
+        allow = self_open  # each stream attends only its own tokens (block-diagonal)
+    elif routing == "routed":
+        allow = (
+            (is_tq & (is_tk | condk))        # target query  -> target + present conditions
+            | (condq & condk)                # condition query -> present conditions (never the noised target)
+            | self_open
+        )
+    else:
+        raise ValueError(f"unknown routing '{routing}' (expected routed | selfonly)")  # (B, S, S) bool
     block = torch.zeros(b, NUM_STREAMS, NUM_STREAMS, dtype=dtype, device=device)
     block.masked_fill_(~allow, float("-inf"))
     # stream-level (B, S, S) -> token-level (B, S*N, S*N), then add a head axis

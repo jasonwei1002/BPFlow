@@ -30,6 +30,8 @@ class ModelConfig:
     depth: int = 12
     mlp_ratio: float = 4.0
     joint_depth: int = 8  # number of 3-stream (ABP+ECG+PPG) joint-attention layers
+    # --- ablation knob (main model = joint) ---
+    stream_fusion: str = "joint"   # joint = 3-stream cross-attention | late = per-stream self-attention then late concat-fusion
 
 
 @dataclass

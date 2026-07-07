@@ -75,6 +75,7 @@ class BPFlowModel(nn.Module):
         depth: int,
         joint_depth: int,
         mlp_ratio: float = 4.0,
+        stream_fusion: str = "joint",
     ) -> None:
         super().__init__()
         if seq_len % patch_size != 0:
@@ -87,6 +88,9 @@ class BPFlowModel(nn.Module):
             )
         if not 0 < joint_depth <= depth:
             raise ValueError(f"joint_depth {joint_depth} must be in (0, depth={depth}]")
+        if stream_fusion not in ("joint", "late"):
+            raise ValueError(f"stream_fusion must be 'joint' or 'late', got '{stream_fusion}'")
+        self.stream_fusion = stream_fusion
 
         self.seq_len = seq_len
         self.patch_size = patch_size
@@ -138,6 +142,12 @@ class BPFlowModel(nn.Module):
         )
         # per-modality flow-decode heads (the gathered target stream -> its flow).
         self.heads = nn.ModuleList([FinalBlock(hidden_dim, self.latent_dim) for _ in range(3)])
+        # late-fusion ablation (C1): with stream_fusion='late' the joint blocks run
+        # self-only (block-diagonal mask), then the three per-token stream reps are
+        # concatenated and projected here to form the target rep, replacing the joint
+        # cross-attention. Only constructed for the 'late' variant, so in the default
+        # 'joint' model there is no unused parameter (DDP find_unused_parameters=False).
+        self.late_fuse = nn.Linear(3 * hidden_dim, hidden_dim) if stream_fusion == "late" else None
 
         self.initialize_weights()
         latent_rot = compute_rope_rotations(self.latent_seq_len, head_dim, 10000, device="cpu")
@@ -211,7 +221,12 @@ class BPFlowModel(nn.Module):
         cond_sum = is_cond[:, 1].view(b, 1) * ecg_c.mean(dim=1) + is_cond[:, 2].view(b, 1) * ppg_c.mean(dim=1)
         num_cond = is_cond[:, 1:].sum(dim=1, keepdim=True).clamp(min=1.0)
         pooled = self.global_cond_mlp(cond_sum / num_cond)
-        attn_mask = build_task_mask(target_idx, cp, self.latent_seq_len, dtype=dt, device=dev)
+        # late fusion encodes streams independently -> block-diagonal (selfonly) mask;
+        # otherwise the no-leak routed task mask.
+        routing = "selfonly" if self.stream_fusion == "late" else "routed"
+        attn_mask = build_task_mask(
+            target_idx, cp, self.latent_seq_len, dtype=dt, device=dev, routing=routing
+        )
         return BPConditions(
             stream_base=stream_base,
             is_target=is_target,
@@ -236,11 +251,17 @@ class BPFlowModel(nn.Module):
         global_c = self.t_embed(t).unsqueeze(1) + conditions.pooled.unsqueeze(1)  # (B,1,H)
         for block in self.joint_blocks:
             latent, ecg, ppg = block(latent, ecg, ppg, global_c, self.latent_rot, conditions.attn_mask)
-        # gather the per-sample target stream, refine, decode with its head
-        stacked = torch.stack([latent, ecg, ppg], dim=1)  # (B, 3, N, H)
-        n, h = stacked.shape[2], stacked.shape[3]
+        n, h = latent.shape[1], latent.shape[2]
         gi = conditions.target_idx.view(b, 1, 1, 1)
-        tgt = stacked.gather(1, gi.expand(b, 1, n, h)).squeeze(1)  # (B, N, H)
+        if self.late_fuse is not None:
+            # late-fusion ablation: streams were encoded independently (selfonly mask),
+            # so concat the three per-token stream reps and project to the target rep,
+            # replacing the joint cross-attention gather.
+            tgt = self.late_fuse(torch.cat([latent, ecg, ppg], dim=-1))  # (B, N, H)
+        else:
+            # gather the per-sample target stream from the jointly-attended streams
+            stacked = torch.stack([latent, ecg, ppg], dim=1)  # (B, 3, N, H)
+            tgt = stacked.gather(1, gi.expand(b, 1, n, h)).squeeze(1)  # (B, N, H)
         for block in self.fused_blocks:
             tgt = block(tgt, global_c, self.latent_rot)
         # apply every head (keeps all in the graph), then gather the target's output
