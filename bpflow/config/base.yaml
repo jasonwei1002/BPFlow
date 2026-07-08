@@ -34,7 +34,7 @@ data:
   # the single fixed task val uses ("" = first ->ABP task). A single-element tasks
   # list = a specialist. Default: all five, ->ABP-heavy. Inherited by pulsedb/uci/smoke.
   tasks: [ecg_ppg2abp, ecg2abp, ppg2abp, ppg2ecg, ecg2ppg]
-  task_probs: [0.30, 0.20, 0.20, 0.15, 0.15]
+  task_probs: [0.20, 0.30, 0.30, 0.10, 0.10]
   eval_task: ""
 
 sampling:
