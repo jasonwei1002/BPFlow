@@ -39,9 +39,15 @@ from pathlib import Path
 
 base = Path(sys.argv[1])
 steps = [int(x) for x in sys.argv[2:]]
-# metric suffixes to pull from each step's summary.json (task prefix stripped)
-WANT = ["waveform/MAE", "waveform/RMSE", "waveform/Pearson",
-        "SBP/AAMI/pass", "DBP/AAMI/pass", "MAP/AAMI/pass"]
+# metric suffixes to pull from each step's summary.json (task prefix stripped).
+# Full clinical block so steps_summary.json mirrors the per-seed metrics: waveform
+# + per-site AAMI (ME/SDE/pass) + BHS (<=5/10/15 mmHg). BHS letter grade is a
+# per-seed string (not aggregated into summary.json), so it is not collected here.
+WAVE = ["waveform/MAE", "waveform/RMSE", "waveform/Pearson"]
+SITES = ["SBP", "DBP", "MAP"]
+CLIN = [f"{bp}/AAMI/{m}" for bp in SITES for m in ("ME", "SDE", "pass")] + \
+       [f"{bp}/BHS/<={t}mmHg" for bp in SITES for t in (5, 10, 15)]
+WANT = WAVE + CLIN
 
 def pick(summary, suffix):
     # single-task summary keys look like "<task>/<suffix>"; match by suffix
@@ -61,22 +67,19 @@ for K in steps:
 
 (base / "steps_summary.json").write_text(json.dumps(table, indent=2))
 
-# compact console table
+# compact console table (waveform quality only; full clinical block -> steps_summary.json)
+def fmt(m, d=3):
+    return f"{m['mean']:.{d}f}+/-{m['std']:.{d}f}" if m else "n/a"
+
 print(f"\n=== steps sweep (flagship ECG+PPG->ABP): {base.name} ===")
-hdr = f"{'steps(NFE)':>10} | {'MAE(mmHg)':>16} | {'Pearson':>16} | {'SBP/DBP/MAP AAMI pass':>22}"
+hdr = f"{'steps(NFE)':>10} | {'MAE(mmHg)':>16} | {'RMSE(mmHg)':>16} | {'Pearson':>16}"
 print(hdr); print("-" * len(hdr))
 for K in steps:
     row = table.get(K)
     if not row:
         continue
-    def fmt(m):
-        return f"{m['mean']:.3f}+/-{m['std']:.3f}" if m else "n/a"
-    mae = fmt(row.get("waveform/MAE"))
-    r = fmt(row.get("waveform/Pearson"))
-    aami = "/".join(
-        (f"{row[k]['mean']:.2f}" if row.get(k) else "n/a")
-        for k in ("SBP/AAMI/pass", "DBP/AAMI/pass", "MAP/AAMI/pass"))
-    print(f"{K:>10} | {mae:>16} | {r:>16} | {aami:>22}")
-print(f"\nfull table -> {base / 'steps_summary.json'}")
+    print(f"{K:>10} | {fmt(row.get('waveform/MAE')):>16} | "
+          f"{fmt(row.get('waveform/RMSE')):>16} | {fmt(row.get('waveform/Pearson'), 4):>16}")
+print(f"\nfull metrics (AAMI ME/SDE/pass + BHS per site) -> {base / 'steps_summary.json'}")
 PY
 echo "[sweep_steps] done -> $SWEEP/steps_summary.json"
