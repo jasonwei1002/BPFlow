@@ -36,8 +36,41 @@ def _arrow(task: str) -> str:
     return f"{cond.upper().replace('_', '+')} -> {tgt.upper()}"
 
 
-def _load_weights(model: torch.nn.Module, ckpt_path: str, use_ema: bool, cfg) -> set:
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+def _read_checkpoint(ckpt_path: str):
+    """Load a checkpoint once (weights + stored config) so architecture restore and
+    weight loading share a single read — checkpoints are large."""
+    return torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+
+def _restore_arch_from_ckpt(cfg, ckpt) -> None:
+    """Rebuild the model with the architecture the checkpoint was TRAINED with.
+
+    Training selects architecture via CLI overrides (e.g. ``model.stream_fusion=late``
+    for the late-fusion ablation), but ``bpflow.infer`` takes no dotted overrides — so
+    without this a checkpoint trained with a non-default architecture can't be rebuilt
+    and ``load_state_dict`` fails on the mismatched keys. The checkpoint stores its full
+    resolved config and every ``build_model`` input lives under ``cfg.model``, so copy
+    those fields over in place. Data-side constants (``abp_mean``/``abp_std``) are left
+    alone — ``_load_weights`` still asserts them. Old/flat checkpoints without a stored
+    config are left as-is (the passed-in config wins).
+    """
+    ck_cfg = ckpt.get("config") if isinstance(ckpt, dict) else None
+    ck_model = ck_cfg.get("model") if isinstance(ck_cfg, dict) else None
+    if not isinstance(ck_model, dict):
+        return
+    changed = {}
+    for key, val in ck_model.items():
+        if key in cfg.model and cfg.model[key] != val:
+            changed[key] = (cfg.model[key], val)
+            cfg.model[key] = val
+    if changed:
+        logger.info(
+            "Restored architecture from checkpoint config: %s",
+            ", ".join(f"{k}: {a!r} -> {b!r}" for k, (a, b) in changed.items()),
+        )
+
+
+def _load_weights(model: torch.nn.Module, ckpt, use_ema: bool, cfg, ckpt_path: str = "") -> set:
     if isinstance(ckpt, dict) and "model" in ckpt:
         # assert normalization constants match (else denormalized mmHg is biased)
         for key in ("abp_mean", "abp_std"):
@@ -178,8 +211,13 @@ def run_inference(args: argparse.Namespace) -> None:
         ds = Subset(ds, list(range(rank, total, world_size)))
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
+    # Restore the checkpoint's own architecture (e.g. stream_fusion=late) BEFORE
+    # building — infer takes no dotted overrides, so the config file alone can't
+    # spell out an ablated architecture. Reads the ckpt once and reuses it below.
+    ckpt = _read_checkpoint(args.ckpt)
+    _restore_arch_from_ckpt(cfg, ckpt)
     model = build_model(cfg).to(device).eval()
-    trained = _load_weights(model, args.ckpt, args.use_ema, cfg)
+    trained = _load_weights(model, ckpt, args.use_ema, cfg, args.ckpt)
 
     fm = build_flow_matching(cfg)
     gen = torch.Generator(device=device)
